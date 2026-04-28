@@ -1,3 +1,5 @@
+#AANPASSING GEMAAKT VANOP LAPTOP
+
 import time
 import threading
 import cv2
