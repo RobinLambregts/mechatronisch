@@ -1,1 +1,7 @@
+XLAUNCH
+
+set DISPLAY=localhost:0.0
+
 ssh -Y rasberry@10.25.232.215
+
+password: pi
