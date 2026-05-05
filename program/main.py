@@ -234,13 +234,13 @@ PWM_FREQ = 40
 TOLERANTIE = 1.0
 MAX_DC = 40
 MIN_DC = {
-    2: 28,   # motor 2 heeft meer kracht nodig
-    3: 20    # motor 3 is lichter / gevoeliger
+    2: 10,
+    3: 10
 }
 
 # PI Parameters
-KP = 0.0   # 1.2 Iets verhoogd voor snellere reactie
-KI = 0.0   # 0.5 De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
+KP = 1.2   # Iets verhoogd voor snellere reactie
+KI = 0.5   # De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
 MAX_I = 15 # Anti-windup: de maximale bijdrage van de I-term aan de duty cycle
 
 IMU_MOTOR_MAP = {MPU1_ADDR: 2, MPU2_ADDR: 3}
@@ -309,7 +309,7 @@ def bereken_pi_dc(m_id, fout):
     dc = int(
         base_min +
         (MAX_DC - base_min) *
-        min(output_abs / 30.0, 1.0)
+        min(output_abs / 15.0, 1.0)
     )
     
     return max(base_min, min(MAX_DC, dc)), richting
