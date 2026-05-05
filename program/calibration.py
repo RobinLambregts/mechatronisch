@@ -63,10 +63,10 @@ def voer_kalibratie_uit():
     print()
 
     # IMU1 (Motor 2) kalibreren op 90 graden
-    succes1 = kalibreer_imu(imus.MPU1_ADDR, doel_hoek=90.0)
+    succes1 = kalibreer_imu(imus.MPU1_ADDR, doel_hoek=0.0)
     
     # IMU2 (Motor 3) kalibreren op 0 graden
-    succes2 = kalibreer_imu(imus.MPU2_ADDR, doel_hoek=0.0)
+    succes2 = kalibreer_imu(imus.MPU2_ADDR, doel_hoek=90.0)
 
     print()
     if succes1 and succes2:
