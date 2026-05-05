@@ -233,7 +233,10 @@ config = {
 PWM_FREQ = 40
 TOLERANTIE = 1.0
 MAX_DC = 40
-MIN_DC = 25
+MIN_DC = {
+    2: 28,   # motor 2 heeft meer kracht nodig
+    3: 20    # motor 3 is lichter / gevoeliger
+}
 
 # PI Parameters
 KP = 1.2   # Iets verhoogd voor snellere reactie
@@ -301,11 +304,15 @@ def bereken_pi_dc(m_id, fout):
     # Duty cycle schalen (gebruik absolute waarde van de output)
     output_abs = abs(pi_output)
     
-    # Schaling naar Duty Cycle (0-100)
-    # We mappen 0-30 graden fout naar MIN_DC tot MAX_DC
-    dc = int(MIN_DC + (MAX_DC - MIN_DC) * min(output_abs / 30.0, 1.0))
+    base_min = MIN_DC[m_id]
+
+    dc = int(
+        base_min +
+        (MAX_DC - base_min) *
+        min(output_abs / 30.0, 1.0)
+    )
     
-    return max(MIN_DC, min(MAX_DC, dc)), richting
+    return max(base_min, min(MAX_DC, dc)), richting
 
 def motor_worker():
     global motor_systeem_actief, motor_statussen
