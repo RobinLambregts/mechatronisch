@@ -101,8 +101,6 @@ def get_angle(addr):
         acc_y = raw_acc_y - imu_offsets[addr]['acc_y']
         acc_z = raw_acc_z - imu_offsets[addr]['acc_z']
         
-        print(f"IMU {hex(addr)} - Raw Acc Y: {raw_acc_y:.4f}, Raw Acc Z: {raw_acc_z:.4f} | Offsets Y: {imu_offsets[addr]['acc_y']:.4f}, Z: {imu_offsets[addr]['acc_z']:.4f}")
-
         if addr == MPU2_ADDR:
             accel_angle = math.degrees(math.atan2(acc_y, acc_z))
         else:
