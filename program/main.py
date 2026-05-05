@@ -59,6 +59,20 @@ def read_word(addr, reg):
         val = -((65535 - val) + 1)
     return val
 
+def angle_difference(target, current):
+    """
+    Geeft kortste hoekverschil terug (-180 tot 180)
+    """
+    diff = target - current
+
+    while diff > 180:
+        diff -= 360
+
+    while diff < -180:
+        diff += 360
+
+    return diff
+
 def get_angle(addr):
     """
     Complementary filter:
@@ -307,7 +321,7 @@ def motor_worker():
             hoek = get_angle(imu_addr)
             if hoek is None: continue
             
-            fout = doel - hoek
+            fout = angle_difference(doel, hoek)
             
             if abs(fout) <= TOLERANTIE:
                 pwm_motoren[m_id].ChangeDutyCycle(0)
