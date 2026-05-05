@@ -238,7 +238,7 @@ def motor_worker():
                 continue
             
             doel = actieve_doelen[m_id]['doel']
-            hoek = imus.get_angle(imu_addr)
+            hoek = get_angle(imu_addr)
             if hoek is None: continue
             
             fout = doel - hoek
@@ -266,6 +266,10 @@ def motor_worker():
                     else:
                         pwm_motoren[m_id].ChangeDutyCycle(0)
         time.sleep(0.05)
+        
+        # Start de motor worker thread
+motor_thread = threading.Thread(target=motor_worker, daemon=True)
+motor_thread.start()
 
 # ==========================================
 # 4. TERMINAL INPUT THREAD
@@ -399,7 +403,7 @@ try:
         kal_tekst = "Kalibratie: actief" if kal_actief else "Kalibratie: niet uitgevoerd"
         tekst(frame, kal_tekst, 200, kal_kleur)
 
-        tekst(frame, f"PWM:{PWM_FREQ}Hz | DC:{MIN_DC}-{MAX_DC}% | KP:{KP} KD:{KD}", 240, (100, 100, 255))
+        tekst(frame, f"PWM:{PWM_FREQ}Hz | DC:{MIN_DC}-{MAX_DC}% | KP:{KP} KI:{KI}", 240, (100, 100, 255))
         tekst(frame, "ESC=afsluiten | Terminal: doelhoek/'hoek'/'calibrate'", 280, (180, 180, 180))
 
         cv2.imshow("Robot Besturing", frame)
