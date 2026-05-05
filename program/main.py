@@ -43,7 +43,7 @@ imu_state = {
 # Filter verhouding
 # 0.98 = vertrouw vooral gyro
 # 0.02 = accel corrigeert drift
-ALPHA = 0.98
+ALPHA = 0.60
 
 def init_mpu(addr):
     try:
@@ -144,8 +144,6 @@ def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
     gem_z = som_z / gelezen
     gem_gyro = som_gyro / gelezen
 
-    # Bereken de verwachte acc waarden op basis van de doelhoek
-    # Bij 0°: y=0, z=1 | Bij 90°: y=1, z=0
     rad = math.radians(target_angle)
     expected_y = math.sin(rad)
     expected_z = math.cos(rad)
