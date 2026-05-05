@@ -43,7 +43,7 @@ imu_state = {
 # Filter verhouding
 # 0.98 = vertrouw vooral gyro
 # 0.02 = accel corrigeert drift
-ALPHA = 0.60
+ALPHA = 0.80
 
 def init_mpu(addr):
     try:
