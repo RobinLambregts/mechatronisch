@@ -234,8 +234,8 @@ PWM_FREQ = 40
 TOLERANTIE = 1.0
 MAX_DC = 40
 MIN_DC = {
-    2: 10,
-    3: 10
+    2: 0,
+    3: 0
 }
 
 # PI Parameters
