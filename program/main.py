@@ -17,20 +17,33 @@ MPU2_ADDR = 0x69
 
 # Calibratie offsets (worden ingesteld door kalibratieprocedure)
 imu_offsets = {
-    MPU1_ADDR: {'acc_y': 0.0, 'acc_z': 0.0},
-    MPU2_ADDR: {'acc_y': 0.0, 'acc_z': 0.0},
+    MPU1_ADDR: {
+        'acc_y': 0.0,
+        'acc_z': 0.0,
+        'gyro_x': 0.0
+    },
+    MPU2_ADDR: {
+        'acc_y': 0.0,
+        'acc_z': 0.0,
+        'gyro_x': 0.0
+    },
 }
 
-filtered_angles = {
-    MPU1_ADDR: 0.0,
-    MPU2_ADDR: 0.0,
+imu_state = {
+    MPU1_ADDR: {
+        'angle': 0.0,
+        'last_time': time.time()
+    },
+    MPU2_ADDR: {
+        'angle': 0.0,
+        'last_time': time.time()
+    }
 }
 
-ALPHA = 0.1
-# lager = meer smoothing
-# 0.1 = stabiel
-# 0.2 = sneller
-# 0.05 = heel smooth
+# Filter verhouding
+# 0.98 = vertrouw vooral gyro
+# 0.02 = accel corrigeert drift
+ALPHA = 0.98
 
 def init_mpu(addr):
     try:
@@ -48,25 +61,56 @@ def read_word(addr, reg):
 
 def get_angle(addr):
     """
-    Rotatie rond de X-as met smoothing/filtering.
+    Complementary filter:
+    combineert gyro + accelerometer
     """
-    global filtered_angles
 
     try:
+        state = imu_state[addr]
+
+        # =========================
+        # Tijd berekenen
+        # =========================
+        now = time.time()
+        dt = now - state['last_time']
+        state['last_time'] = now
+
+        if dt <= 0 or dt > 1:
+            dt = 0.01
+
+        # =========================
+        # ACCELEROMETER
+        # =========================
         raw_acc_y = read_word(addr, 0x3D) / 16384.0
         raw_acc_z = read_word(addr, 0x3F) / 16384.0
 
         acc_y = raw_acc_y - imu_offsets[addr]['acc_y']
         acc_z = raw_acc_z - imu_offsets[addr]['acc_z']
 
-        raw_angle = math.degrees(math.atan2(acc_y, acc_z))
+        accel_angle = math.degrees(math.atan2(acc_y, acc_z))
 
-        filtered_angles[addr] = (
-            ALPHA * raw_angle
-            + (1 - ALPHA) * filtered_angles[addr]
+        # =========================
+        # GYROSCOOP
+        # =========================
+        gyro_x = (
+            read_word(addr, 0x43) / 131.0
+            - imu_offsets[addr]['gyro_x']
         )
 
-        return round(filtered_angles[addr], 2)
+        # Gyro integratie
+        gyro_angle = state['angle'] + gyro_x * dt
+
+        # =========================
+        # COMPLEMENTARY FILTER
+        # =========================
+        angle = (
+            ALPHA * gyro_angle
+            + (1 - ALPHA) * accel_angle
+        )
+
+        state['angle'] = angle
+
+        return round(angle, 2)
 
     except Exception as e:
         print(f"IMU {hex(addr)} leesfout: {e}")
@@ -80,11 +124,13 @@ def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
     print(f"  Kalibreren IMU {hex(addr)} naar {target_angle}° ({num_samples} samples)...", end='', flush=True)
     som_y = 0.0
     som_z = 0.0
+    som_gyro = 0.0
     gelezen = 0
     for _ in range(num_samples):
         try:
             som_y += read_word(addr, 0x3D) / 16384.0
             som_z += read_word(addr, 0x3F) / 16384.0
+            som_gyro += read_word(addr, 0x43) / 131.0
             gelezen += 1
         except Exception as e:
             print(f"\n  Leesfout tijdens kalibratie IMU {hex(addr)}: {e}")
@@ -96,6 +142,7 @@ def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
 
     gem_y = som_y / gelezen
     gem_z = som_z / gelezen
+    gem_gyro = som_gyro / gelezen
 
     # Bereken de verwachte acc waarden op basis van de doelhoek
     # Bij 0°: y=0, z=1 | Bij 90°: y=1, z=0
@@ -106,6 +153,10 @@ def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
     # Offset = gemeten gemiddelde - verwachte waarde
     imu_offsets[addr]['acc_y'] = gem_y - expected_y
     imu_offsets[addr]['acc_z'] = gem_z - expected_z
+    imu_offsets[addr]['gyro_x'] = gem_gyro
+    
+    imu_state[addr]['angle'] = target_angle
+    imu_state[addr]['last_time'] = time.time()
 
     print(f" Klaar.")
     return True
