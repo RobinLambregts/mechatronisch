@@ -101,7 +101,10 @@ def get_angle(addr):
         acc_y = raw_acc_y - imu_offsets[addr]['acc_y']
         acc_z = raw_acc_z - imu_offsets[addr]['acc_z']
 
-        accel_angle = math.degrees(math.atan2(acc_y, acc_z))
+        if addr == MPU2_ADDR:
+            accel_angle = math.degrees(math.atan2(acc_z, acc_y))
+        else:
+            accel_angle = math.degrees(math.atan2(acc_y, acc_z))
 
         # =========================
         # GYROSCOOP
