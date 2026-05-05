@@ -230,10 +230,10 @@ config = {
     3: {'dir': 20, 'pulse': 21}
 }
 
-PWM_FREQ = 20
+PWM_FREQ = 40
 TOLERANTIE = 1.0
 MAX_DC = 40
-MIN_DC = 8
+MIN_DC = 25
 
 # PI Parameters
 KP = 1.2   # Iets verhoogd voor snellere reactie
