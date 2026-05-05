@@ -239,8 +239,8 @@ MIN_DC = {
 }
 
 # PI Parameters
-KP = 1.2   # Iets verhoogd voor snellere reactie
-KI = 0.5   # De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
+KP = 0.0   # 1.2 Iets verhoogd voor snellere reactie
+KI = 0.0   # 0.5 De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
 MAX_I = 15 # Anti-windup: de maximale bijdrage van de I-term aan de duty cycle
 
 IMU_MOTOR_MAP = {MPU1_ADDR: 2, MPU2_ADDR: 3}
