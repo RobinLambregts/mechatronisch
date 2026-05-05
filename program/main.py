@@ -201,7 +201,7 @@ def voer_kalibratie_uit():
 
     # Hier passen we de doelhoeken aan: IMU1 = 0°, IMU2 = 90°
     succes1 = kalibreer_imu(MPU1_ADDR, target_angle=0)
-    succes2 = kalibreer_imu(MPU2_ADDR, target_angle=90)
+    succes2 = kalibreer_imu(MPU2_ADDR, target_angle=-90)
 
     print()
     if succes1 and succes2:
