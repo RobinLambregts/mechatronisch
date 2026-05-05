@@ -21,6 +21,17 @@ imu_offsets = {
     MPU2_ADDR: {'acc_y': 0.0, 'acc_z': 0.0},
 }
 
+filtered_angles = {
+    MPU1_ADDR: 0.0,
+    MPU2_ADDR: 0.0,
+}
+
+ALPHA = 0.1
+# lager = meer smoothing
+# 0.1 = stabiel
+# 0.2 = sneller
+# 0.05 = heel smooth
+
 def init_mpu(addr):
     try:
         bus.write_byte_data(addr, 0x6B, 0)
@@ -37,20 +48,26 @@ def read_word(addr, reg):
 
 def get_angle(addr):
     """
-    Rotatie rond de X-as: atan2(acc_y, acc_z)
-    Registers:
-      acc_x = 0x3B / 0x3C
-      acc_y = 0x3D / 0x3E  ← gebruikt
-      acc_z = 0x3F / 0x40  ← gebruikt
-    Calibratie-offsets worden afgetrokken van de ruwe waarden.
+    Rotatie rond de X-as met smoothing/filtering.
     """
+    global filtered_angles
+
     try:
         raw_acc_y = read_word(addr, 0x3D) / 16384.0
         raw_acc_z = read_word(addr, 0x3F) / 16384.0
+
         acc_y = raw_acc_y - imu_offsets[addr]['acc_y']
         acc_z = raw_acc_z - imu_offsets[addr]['acc_z']
-        angle = math.degrees(math.atan2(acc_y, acc_z))
-        return round(angle, 2)
+
+        raw_angle = math.degrees(math.atan2(acc_y, acc_z))
+
+        filtered_angles[addr] = (
+            ALPHA * raw_angle
+            + (1 - ALPHA) * filtered_angles[addr]
+        )
+
+        return round(filtered_angles[addr], 2)
+
     except Exception as e:
         print(f"IMU {hex(addr)} leesfout: {e}")
         return None
