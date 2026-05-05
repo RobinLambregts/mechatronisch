@@ -55,16 +55,12 @@ def get_angle(addr):
         print(f"IMU {hex(addr)} leesfout: {e}")
         return None
 
-def kalibreer_imu(addr, num_samples=200, vertraging=0.01):
+def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
     """
     Kalibratieprocedure voor één IMU:
-    - Lees num_samples metingen
-    - Bereken gemiddelde acc_y en acc_z
-    - Bereken de verwachte waarden bij vlakke ligging (acc_y=0, acc_z=1g)
-    - Sla de offsets op zodat get_angle() gecorrigeerde waarden geeft
-    Geeft True terug bij succes, False bij fout.
+    - target_angle: de hoek die de IMU moet aangeven na kalibratie (bijv. 0 of 90)
     """
-    print(f"  Kalibreren IMU {hex(addr)} ({num_samples} samples)...", end='', flush=True)
+    print(f"  Kalibreren IMU {hex(addr)} naar {target_angle}° ({num_samples} samples)...", end='', flush=True)
     som_y = 0.0
     som_z = 0.0
     gelezen = 0
@@ -84,28 +80,32 @@ def kalibreer_imu(addr, num_samples=200, vertraging=0.01):
     gem_y = som_y / gelezen
     gem_z = som_z / gelezen
 
-    # Bij vlakke ligging verwacht: acc_y = 0, acc_z = 1.0 (1g)
+    # Bereken de verwachte acc waarden op basis van de doelhoek
+    # Bij 0°: y=0, z=1 | Bij 90°: y=1, z=0
+    rad = math.radians(target_angle)
+    expected_y = math.sin(rad)
+    expected_z = math.cos(rad)
+
     # Offset = gemeten gemiddelde - verwachte waarde
-    imu_offsets[addr]['acc_y'] = gem_y - 0.0
-    imu_offsets[addr]['acc_z'] = gem_z - 1.0
+    imu_offsets[addr]['acc_y'] = gem_y - expected_y
+    imu_offsets[addr]['acc_z'] = gem_z - expected_z
 
     print(f" Klaar.")
-    print(f"    gem_y={gem_y:.4f}  gem_z={gem_z:.4f}")
-    print(f"    offset_y={imu_offsets[addr]['acc_y']:.4f}  offset_z={imu_offsets[addr]['acc_z']:.4f}")
     return True
 
 def voer_kalibratie_uit():
     """
-    Volledige kalibratieprocedure voor beide IMUs.
-    Stopt alle actieve motordoelen, wacht op stilstand, en kalibreeert.
+    Volledige kalibratieprocedure. 
+    Motor 2 (IMU1) wordt op 0 graden gezet.
+    Motor 3 (IMU2) wordt op 90 graden gezet.
     """
     print("\n" + "="*50)
     print("IMU KALIBRATIE GESTART")
     print("="*50)
-    print("! Zorg dat de robot VLAK en STIL staat.")
-    print("  Wacht 3 seconden voor de meting begint...")
+    print("! Zorg dat de robot in de KALIBRATIEPOSITIE staat.")
+    print("  (Motor 2 horizontaal, Motor 3 verticaal/90 graden)")
+    print("  Wacht 3 seconden...")
 
-    # Annuleer alle actieve motordoelen
     with doel_lock:
         for m_id in motor_doel:
             motor_doel[m_id]['actief'] = False
@@ -116,18 +116,19 @@ def voer_kalibratie_uit():
         time.sleep(1)
     print()
 
-    succes1 = kalibreer_imu(MPU1_ADDR)
-    succes2 = kalibreer_imu(MPU2_ADDR)
+    # Hier passen we de doelhoeken aan: IMU1 = 0°, IMU2 = 90°
+    succes1 = kalibreer_imu(MPU1_ADDR, target_angle=0)
+    succes2 = kalibreer_imu(MPU2_ADDR, target_angle=90)
 
     print()
     if succes1 and succes2:
-        print("✓ Kalibratie van beide IMUs geslaagd.")
+        print("✓ Kalibratie geslaagd.")
         hoek1 = get_angle(MPU1_ADDR)
         hoek2 = get_angle(MPU2_ADDR)
-        print(f"  Gecalibreerde hoek IMU1 (Motor 2): {hoek1}°  (verwacht ≈ 0°)")
-        print(f"  Gecalibreerde hoek IMU2 (Motor 3): {hoek2}°  (verwacht ≈ 0°)")
+        print(f"  Gecalibreerde hoek IMU1 (M2): {hoek1}° (verwacht ≈ 0°)")
+        print(f"  Gecalibreerde hoek IMU2 (M3): {hoek2}° (verwacht ≈ 90°)")
     else:
-        print("✗ Kalibratie DEELS MISLUKT. Controleer de IMU-verbinding.")
+        print("✗ Kalibratie deels mislukt.")
     print("="*50 + "\n")
 
 init_mpu(MPU1_ADDR)
