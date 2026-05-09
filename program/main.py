@@ -1,528 +1,292 @@
-#AANPASSING GEMAAKT VANOP LAPTOP
+"""
+main.py - Bier inkap robot
+==========================
+Start: python3 main.py
+
+Workflow:
+  1. Init IMUs + motoren + camera
+  2. Automatische kalibratie (flesje 0°, glas -90°)
+  3. Wacht op "start" commando in terminal
+  4. Vul-routine:
+       a. Motor 2 (flesje) draait naar 50° — bier begint te vloeien
+       b. Camera monitort schuim continu
+       c. Glas (Motor 3) stuurt bij op basis van schuimverhouding
+          - te veel schuim  → glas schuiner  (meer richting -90°)
+          - te weinig schuim → glas rechter  (meer richting -40°)
+          - overflow         → stop onmiddellijk
+       d. Als flesje leeg is (geen bierflow meer) → eindfase
+       e. Glas langzaam rechtop zetten (naar -40°)
+       f. Motoren stoppen
+  5. UI venster toont live status
+"""
 
 import time
 import threading
 import cv2
 import numpy as np
-import smbus
-import math
-import RPi.GPIO as GPIO
+
+import imus
+import motors
+import camera
+import input as inp
+from calibration import voer_kalibratie_uit
 
 # ==========================================
-# 0. IMU SETUP
+# Inkap-algoritme parameters
 # ==========================================
-bus = smbus.SMBus(1)
-MPU1_ADDR = 0x68
-MPU2_ADDR = 0x69
+FLESJE_VULDOEL   = 45.0    # hoek flesje tijdens gieten
+FLESJE_START     = 0.0     # startpositie flesje
+GLAS_START       = -90.0   # startpositie glas (schuin)
+GLAS_RECHTOP     = -45.0   # eindpositie glas (bijna rechtop)
 
-# Calibratie offsets (worden ingesteld door kalibratieprocedure)
-imu_offsets = {
-    MPU1_ADDR: {
-        'acc_y': 0.0,
-        'acc_z': 0.0,
-        'gyro_x': 0.0
-    },
-    MPU2_ADDR: {
-        'acc_y': 0.0,
-        'acc_z': 0.0,
-        'gyro_x': 0.0
-    },
-}
+# Bijsturingsgrootte voor glas (graden per stap)
+GLAS_STAP_GROOT  = 3.0
+GLAS_STAP_KLEIN  = 1.5
 
-imu_state = {
-    MPU1_ADDR: {
-        'angle': 0.0,
-        'last_time': time.time()
-    },
-    MPU2_ADDR: {
-        'angle': 0.0,
-        'last_time': time.time()
-    }
-}
+# Tijd tussen camera-checks tijdens gieten
+CAMERA_CHECK_INTERVAL = 0.3   # seconden
 
-# Filter verhouding
-# 0.98 = vertrouw vooral gyro
-# 0.02 = accel corrigeert drift
-ALPHA = 0.80
+# Glas grenzen
+GLAS_MIN = -90.0
+GLAS_MAX = -40.0
 
-def init_mpu(addr):
-    try:
-        bus.write_byte_data(addr, 0x6B, 0)
-    except:
-        print(f"IMU {hex(addr)} niet gevonden")
+# ==========================================
+# Globale vlaggen
+# ==========================================
+_vul_bezig  = False
+_stop_vlag  = threading.Event()
+_stop_prog  = False
 
-def read_word(addr, reg):
-    high = bus.read_byte_data(addr, reg)
-    low  = bus.read_byte_data(addr, reg + 1)
-    val  = (high << 8) + low
-    if val >= 0x8000:
-        val = -((65535 - val) + 1)
-    return val
 
-def angle_difference(target, current):
-    """
-    Geeft kortste hoekverschil terug (-180 tot 180)
-    """
-    diff = target - current
+# ==========================================
+# Inkap routine
+# ==========================================
+def vul_routine():
+    global _vul_bezig
+    if _vul_bezig:
+        print("[Vul] Al bezig met inkappen.")
+        return
 
-    while diff > 180:
-        diff -= 360
+    _vul_bezig = True
+    _stop_vlag.clear()
 
-    while diff < -180:
-        diff += 360
+    print("\n" + "="*55)
+    print(" INKAPPEN GESTART")
+    print("="*55)
 
-    return diff
+    # Huidige glashoek ophalen als startpunt
+    huidige_glas_hoek = imus.get_angle(imus.MPU2_ADDR) or GLAS_START
 
-def get_angle(addr):
-    """
-    Complementary filter:
-    combineert gyro + accelerometer
-    """
+    # ---- Stap 1: flesje kantelen ----
+    print(f"[1/4] Flesje kantelen naar {FLESJE_VULDOEL}°…")
+    motors.stel_doel_in(2, FLESJE_VULDOEL)
+    if not motors.wacht_op_doel(2, timeout=15):
+        print("  !! Flesje timeout — doorgaan…")
 
-    try:
-        state = imu_state[addr]
+    if _stop_vlag.is_set():
+        _einde_vul()
+        return
 
-        # =========================
-        # Tijd berekenen
-        # =========================
-        now = time.time()
-        dt = now - state['last_time']
-        state['last_time'] = now
+    # ---- Stap 2: actief bijsturen tijdens gieten ----
+    print("[2/4] Bijsturen op basis van schuimdetectie…")
+    geen_flow_teller = 0
 
-        if dt <= 0 or dt > 1:
-            dt = 0.01
+    while not _stop_vlag.is_set():
+        cam = camera.get_camera_data()
+        actie = camera.schuim_actie()
 
-        # =========================
-        # ACCELEROMETER
-        # =========================
-        raw_acc_y = read_word(addr, 0x3D) / 16384.0
-        raw_acc_z = read_word(addr, 0x3F) / 16384.0
-
-        acc_y = raw_acc_y - imu_offsets[addr]['acc_y']
-        acc_z = raw_acc_z - imu_offsets[addr]['acc_z']
-        
-        if addr == MPU2_ADDR:
-            accel_angle = math.degrees(math.atan2(acc_y, acc_z))
-        else:
-            accel_angle = math.degrees(math.atan2(acc_y, acc_z))
-
-        # =========================
-        # GYROSCOOP
-        # =========================
-        gyro_x = (
-            read_word(addr, 0x43) / 131.0
-            - imu_offsets[addr]['gyro_x']
+        foam_pct = round(cam['foam_ratio'] * 100, 1)
+        print(
+            f"  schuim: {foam_pct}%  actie: {actie}"
+            f"  glashoek: {imus.get_angle(imus.MPU2_ADDR)}°",
+            end='\r'
         )
 
-        # Gyro integratie
-        gyro_angle = state['angle'] + gyro_x * dt
-
-        # =========================
-        # COMPLEMENTARY FILTER
-        # =========================
-        angle = (
-            ALPHA * gyro_angle
-            + (1 - ALPHA) * accel_angle
-        )
-
-        state['angle'] = angle
-
-        return round(angle, 2)
-
-    except Exception as e:
-        print(f"IMU {hex(addr)} leesfout: {e}")
-        return None
-
-def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
-    """
-    Kalibratieprocedure voor één IMU:
-    - target_angle: de hoek die de IMU moet aangeven na kalibratie (bijv. 0 of 90)
-    """
-    print(f"  Kalibreren IMU {hex(addr)} naar {target_angle}° ({num_samples} samples)...", end='', flush=True)
-    som_y = 0.0
-    som_z = 0.0
-    som_gyro = 0.0
-    gelezen = 0
-    for _ in range(num_samples):
-        try:
-            som_y += read_word(addr, 0x3D) / 16384.0
-            som_z += read_word(addr, 0x3F) / 16384.0
-            som_gyro += read_word(addr, 0x43) / 131.0
-            gelezen += 1
-        except Exception as e:
-            print(f"\n  Leesfout tijdens kalibratie IMU {hex(addr)}: {e}")
-        time.sleep(vertraging)
-
-    if gelezen == 0:
-        print(f" MISLUKT (geen leesbare samples).")
-        return False
-
-    gem_y = som_y / gelezen
-    gem_z = som_z / gelezen
-    gem_gyro = som_gyro / gelezen
-
-    rad = math.radians(target_angle)
-    expected_y = math.sin(rad)
-    expected_z = math.cos(rad)
-
-    # Offset = gemeten gemiddelde - verwachte waarde
-    imu_offsets[addr]['acc_y'] = gem_y - expected_y
-    imu_offsets[addr]['acc_z'] = gem_z - expected_z
-    imu_offsets[addr]['gyro_x'] = gem_gyro
-    
-    imu_state[addr]['angle'] = target_angle
-    imu_state[addr]['last_time'] = time.time()
-
-    print(f" Klaar.")
-    return True
-
-def voer_kalibratie_uit():
-    """
-    Volledige kalibratieprocedure. 
-    Motor 2 (IMU1) wordt op 0 graden gezet.
-    Motor 3 (IMU2) wordt op 90 graden gezet.
-    """
-    print("\n" + "="*50)
-    print("IMU KALIBRATIE GESTART")
-    print("="*50)
-    print("! Zorg dat de robot in de KALIBRATIEPOSITIE staat.")
-    print("  (Motor 2 horizontaal, Motor 3 verticaal/90 graden)")
-    print("  Wacht 3 seconden...")
-
-    with doel_lock:
-        for m_id in motor_doel:
-            motor_doel[m_id]['actief'] = False
-            pwm_motoren[m_id].ChangeDutyCycle(0)
-
-    for i in range(3, 0, -1):
-        print(f"  {i}...", end='', flush=True)
-        time.sleep(1)
-    print()
-
-    # Hier passen we de doelhoeken aan: IMU1 = 0°, IMU2 = 90°
-    succes1 = kalibreer_imu(MPU1_ADDR, target_angle=0)
-    succes2 = kalibreer_imu(MPU2_ADDR, target_angle=-90)
-
-    print()
-    if succes1 and succes2:
-        print("✓ Kalibratie geslaagd.")
-        hoek1 = get_angle(MPU1_ADDR)
-        hoek2 = get_angle(MPU2_ADDR)
-        print(f"  Gecalibreerde hoek IMU1 (M2): {hoek1}° (verwacht ≈ 0°)")
-        print(f"  Gecalibreerde hoek IMU2 (M3): {hoek2}° (verwacht ≈ 90°)")
-    else:
-        print("✗ Kalibratie deels mislukt.")
-    print("="*50 + "\n")
-
-init_mpu(MPU1_ADDR)
-init_mpu(MPU2_ADDR)
-
-# ==========================================
-# 1. GPIO SETUP
-# ==========================================
-# GPIO Config
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-
-config = {
-    1: {'dir': 17, 'pulse': 22},
-    2: {'dir': 23, 'pulse': 24},
-    3: {'dir': 20, 'pulse': 21}
-}
-
-PWM_FREQ = 40
-TOLERANTIE = 1.0
-MAX_DC = 40
-MIN_DC = {
-    2: 0,
-    3: 0
-}
-
-# PI Parameters
-KP = 5   # Iets verhoogd voor snellere reactie
-KI = 0.2   # 0.5 De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
-MAX_I = 15 # Anti-windup: de maximale bijdrage van de I-term aan de duty cycle
-
-IMU_MOTOR_MAP = {MPU1_ADDR: 2, MPU2_ADDR: 3}
-
-pwm_motoren = {}
-for m_id, pins in config.items():
-    GPIO.setup(pins['dir'], GPIO.OUT)
-    GPIO.setup(pins['pulse'], GPIO.OUT)
-    pwm = GPIO.PWM(pins['pulse'], PWM_FREQ)
-    pwm.start(0)
-    pwm_motoren[m_id] = pwm
-
-motor_systeem_actief = True
-laatste_toets_tijd = time.time()
-motor_statussen = {1: None, 2: None, 3: None}
-motor_doel = {
-    2: {'doel': None, 'actief': False},
-    3: {'doel': None, 'actief': False},
-}
-
-# Staat voor de PI regelaar
-pi_staat = {
-    2: {'integraal': 0.0, 'vorige_tijd': None},
-    3: {'integraal': 0.0, 'vorige_tijd': None},
-}
-doel_lock = threading.Lock()
-
-def bereken_pi_dc(m_id, fout):
-    """
-    PI-regelaar: output = KP*fout + KI * integraal(fout * dt)
-    """
-    nu = time.time()
-    staat = pi_staat[m_id]
-    
-    if staat['vorige_tijd'] is None:
-        dt = 0.0
-    else:
-        dt = nu - staat['vorige_tijd']
-    
-    staat['vorige_tijd'] = nu
-
-    # Bereken Integraal (alleen als de motor niet al op volle kracht staat/windup preventie)
-    # We integreren de signed fout zodat de I-term ook de andere kant op werkt
-    staat['integraal'] += fout * dt
-    
-    # Anti-windup: Begrens de integraal-term
-    # We zorgen dat de KI * integraal niet meer dan MAX_I kan worden
-    if KI != 0:
-        limiet = MAX_I / KI
-        staat['integraal'] = max(min(staat['integraal'], limiet), -limiet)
-
-    # PI Output berekening
-    p_term = KP * fout
-    i_term = KI * staat['integraal']
-    
-    pi_output = p_term + i_term
-    
-    # Richting bepalen (sign van de pi_output)
-    richting = GPIO.HIGH if pi_output > 0 else GPIO.LOW
-    
-    # Duty cycle schalen (gebruik absolute waarde van de output)
-    output_abs = abs(pi_output)
-    
-    base_min = MIN_DC[m_id]
-
-    dc = int(
-        base_min +
-        (MAX_DC - base_min) *
-        min(output_abs / 15.0, 1.0)
-    )
-    
-    return max(base_min, min(MAX_DC, dc)), richting
-
-def motor_worker():
-    global motor_systeem_actief, motor_statussen
-    while motor_systeem_actief:
-        # PI Sturing
-        with doel_lock:
-            actieve_doelen = {m: info.copy() for m, info in motor_doel.items() if info['actief']}
-
-        for imu_addr, m_id in IMU_MOTOR_MAP.items():
-            if m_id not in actieve_doelen:
-                pi_staat[m_id]['vorige_tijd'] = None
-                pi_staat[m_id]['integraal'] = 0.0 # Reset integraal als niet actief
-                continue
-            
-            doel = actieve_doelen[m_id]['doel']
-            hoek = get_angle(imu_addr)
-            if hoek is None: continue
-            
-            fout = angle_difference(doel, hoek)
-            
-            if abs(fout) <= TOLERANTIE:
-                pwm_motoren[m_id].ChangeDutyCycle(0)
-                pi_staat[m_id]['integraal'] = 0.0 # Reset bij bereiken doel
-                with doel_lock: 
-                    motor_doel[m_id]['actief'] = False
-            else:
-                dc, richting = bereken_pi_dc(m_id, fout)
-                GPIO.output(config[m_id]['dir'], richting)
-                pwm_motoren[m_id].ChangeDutyCycle(dc)
-
-        # Handmatige sturing (Toetsenbord)
-        if time.time() - laatste_toets_tijd > 0.15:
-            for m_id, richting in motor_statussen.items():
-                if not (m_id in motor_doel and motor_doel[m_id]['actief']):
-                    if richting == 1:
-                        GPIO.output(config[m_id]['dir'], GPIO.HIGH)
-                        pwm_motoren[m_id].ChangeDutyCycle(MAX_DC)
-                    elif richting == 0:
-                        GPIO.output(config[m_id]['dir'], GPIO.LOW)
-                        pwm_motoren[m_id].ChangeDutyCycle(MAX_DC)
-                    else:
-                        pwm_motoren[m_id].ChangeDutyCycle(0)
-        time.sleep(0.05)
-        
-        # Start de motor worker thread
-motor_thread = threading.Thread(target=motor_worker, daemon=True)
-motor_thread.start()
-
-# ==========================================
-# 4. TERMINAL INPUT THREAD
-# ==========================================
-def terminal_input_worker():
-    while motor_systeem_actief:
-        try:
-            invoer = input(
-                "\nCommando's:\n"
-                "  • Één getal    → beide motoren naar die hoek (bijv. '30')\n"
-                "  • M2:XX M3:YY → elk een eigen hoek (bijv. 'M2:45 M3:-20')\n"
-                "  • 'hoek'       → lees huidige hoek van beide IMUs uit\n"
-                "  • 'calibrate'  → start IMU kalibratieprocedure\n"
-                "  • Enter        → annuleer alle actieve doelen\n> "
-            ).strip()
-
-            # Annuleer alle doelen
-            if invoer == "":
-                with doel_lock:
-                    for m_id in motor_doel:
-                        motor_doel[m_id]['actief'] = False
-                        pwm_motoren[m_id].ChangeDutyCycle(0)
-                print("Alle doelen geannuleerd.")
-                continue
-
-            # Huidige hoek uitlezen
-            if invoer.lower() == "hoek":
-                hoek1 = get_angle(MPU1_ADDR)
-                hoek2 = get_angle(MPU2_ADDR)
-                print(f"Huidige hoek IMU1 (Motor 2): {hoek1}°")
-                print(f"Huidige hoek IMU2 (Motor 3): {hoek2}°")
-                continue
-
-            # IMU kalibratie
-            if invoer.lower() == "calibrate":
-                voer_kalibratie_uit()
-                continue
-
-            # Parsen: "M2:45 M3:-20" of gewoon "30"
-            doelen_parsed = {}
-
-            if invoer.upper().startswith("M"):
-                for deel in invoer.split():
-                    deel = deel.upper()
-                    if deel.startswith("M") and ":" in deel:
-                        m_str, h_str = deel[1:].split(":")
-                        m_id = int(m_str)
-                        if m_id in motor_doel:
-                            doelen_parsed[m_id] = float(h_str)
-                        else:
-                            print(f"Motor {m_id} heeft geen IMU-koppeling, overgeslagen.")
-            else:
-                hoek = float(invoer)
-                doelen_parsed = {2: hoek, 3: hoek}
-
-            if not doelen_parsed:
-                print("Geen geldige invoer herkend.")
-                continue
-
-            with doel_lock:
-                for m_id, doel in doelen_parsed.items():
-                    motor_doel[m_id]['doel']   = doel
-                    motor_doel[m_id]['actief'] = True
-
-            for m_id, doel in doelen_parsed.items():
-                huidige_hoek = get_angle(MPU1_ADDR if m_id == 2 else MPU2_ADDR)
-                print(f"[Motor {m_id}] Naar {doel}° | Huidige hoek: {huidige_hoek}°")
-
-        except ValueError:
-            print("Ongeldige invoer, probeer opnieuw (bijv. '30' of 'M2:45 M3:-20').")
-        except EOFError:
+        if actie == 'overflow':
+            print("\n  !! OVERFLOW RISICO — stop gieten!")
+            motors.stel_doel_in(2, FLESJE_START)   # flesje terug
             break
 
-input_thread = threading.Thread(target=terminal_input_worker, daemon=True)
-input_thread.start()
+        elif actie == 'meer_schuim':
+            # Glas rechter → schuimkraag groeit
+            huidige_glas_hoek = min(huidige_glas_hoek + GLAS_STAP_GROOT, GLAS_MAX)
+            motors.stel_doel_in(3, huidige_glas_hoek)
 
-# ==========================================
-# 5. UI
-# ==========================================
-cv2.namedWindow("Robot Besturing")
-print("="*50)
-print("Handmatige sturing (CV2-venster actief houden):")
-print("  Motor 1: [A] Vooruit | [Q] Achteruit")
-print("  Motor 2: [E] Vooruit | [D] Achteruit")
-print("  Motor 3: [T] Vooruit | [G] Achteruit")
-print("Terminal: geef doelhoek, typ 'hoek' of 'calibrate'")
-print("Druk op 'ESC' om af te sluiten.")
-print("="*50)
+        elif actie == 'minder_schuim':
+            # Glas schuiner → bier loopt langs de wand
+            huidige_glas_hoek = max(huidige_glas_hoek - GLAS_STAP_KLEIN, GLAS_MIN)
+            motors.stel_doel_in(3, huidige_glas_hoek)
 
-# ==========================================
-# 6. MAIN LOOP
-# ==========================================
-try:
-    while True:
-        with doel_lock:
-            doel_m2 = motor_doel[2].copy()
-            doel_m3 = motor_doel[3].copy()
-
-        hoek1 = get_angle(MPU1_ADDR)
-        hoek2 = get_angle(MPU2_ADDR)
-
-        # Toon of kalibratie actief is (niet-nul offsets)
-        kal_actief = any(
-            imu_offsets[a]['acc_y'] != 0.0 or imu_offsets[a]['acc_z'] != 0.0
-            for a in [MPU1_ADDR, MPU2_ADDR]
-        )
-
-        frame = np.zeros((320, 500, 3), dtype=np.uint8)
-
-        def tekst(frame, txt, y, kleur=(255, 255, 255)):
-            cv2.putText(frame, txt, (15, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, kleur, 1)
-
-        tekst(frame, "Robot Besturing", 30, (0, 200, 255))
-        tekst(frame, f"IMU1 (Motor 2): {hoek1}°", 70)
-        tekst(frame, f"IMU2 (Motor 3): {hoek2}°", 100)
-
-        if doel_m2['actief']:
-            fout2 = round(doel_m2['doel'] - (hoek1 or 0), 1)
-            tekst(frame, f"Doel M2: {doel_m2['doel']}°  fout: {fout2}°", 135, (0, 255, 100))
+        elif actie == 'onbekend':
+            geen_flow_teller += 1
+            if geen_flow_teller > 20:
+                print("\n  Geen cameradata → stoppen met bijsturen.")
+                break
         else:
-            tekst(frame, "Doel M2: inactief", 135, (150, 150, 150))
+            geen_flow_teller = 0
 
-        if doel_m3['actief']:
-            fout3 = round(doel_m3['doel'] - (hoek2 or 0), 1)
-            tekst(frame, f"Doel M3: {doel_m3['doel']}°  fout: {fout3}°", 165, (0, 255, 100))
+        # Detecteer of flesje leeg is: bierflow nauwelijks meer detecteerbaar
+        if cam['geldig'] and cam['bier_hoogte_px'] < 5 and cam['schuim_hoogte_px'] < 5:
+            geen_flow_teller += 1
+            if geen_flow_teller > 10:
+                print("\n  Flesje lijkt leeg — gieten stoppen.")
+                break
         else:
-            tekst(frame, "Doel M3: inactief", 165, (150, 150, 150))
+            geen_flow_teller = max(0, geen_flow_teller - 1)
 
-        kal_kleur = (0, 255, 180) if kal_actief else (100, 100, 100)
-        kal_tekst = "Kalibratie: actief" if kal_actief else "Kalibratie: niet uitgevoerd"
-        tekst(frame, kal_tekst, 200, kal_kleur)
+        time.sleep(CAMERA_CHECK_INTERVAL)
 
-        tekst(frame, f"PWM:{PWM_FREQ}Hz | DC:{MIN_DC}-{MAX_DC}% | KP:{KP} KI:{KI}", 240, (100, 100, 255))
-        tekst(frame, "ESC=afsluiten | Terminal: doelhoek/'hoek'/'calibrate'", 280, (180, 180, 180))
+    if _stop_vlag.is_set():
+        _einde_vul()
+        return
 
-        cv2.imshow("Robot Besturing", frame)
-        key = cv2.waitKey(100) & 0xFF
+    # ---- Stap 3: flesje terugplaatsen ----
+    print(f"\n[3/4] Flesje terug naar {FLESJE_START}°…")
+    motors.stel_doel_in(2, FLESJE_START)
+    motors.wacht_op_doel(2, timeout=15)
 
-        if key != 255:
-            laatste_toets_tijd = time.time()
-            if key == ord('a'):   motor_statussen[1] = 1
-            elif key == ord('q'): motor_statussen[1] = 0
-            elif key == ord('e'): motor_statussen[2] = 1
-            elif key == ord('d'): motor_statussen[2] = 0
-            elif key == ord('t'): motor_statussen[3] = 1
-            elif key == ord('g'): motor_statussen[3] = 0
-            elif key == 27:
+    # ---- Stap 4: glas rechtop ----
+    print(f"[4/4] Glas rechtop naar {GLAS_RECHTOP}°…")
+    motors.stel_doel_in(3, GLAS_RECHTOP)
+    motors.wacht_op_doel(3, timeout=20)
+
+    print("\n✓ Inkappen klaar! Geniet van uw pint.")
+    print("="*55 + "\n")
+    _vul_bezig = False
+
+
+def _einde_vul():
+    global _vul_bezig
+    motors.annuleer_alle_doelen()
+    print("\n[Vul] Gestopt door gebruiker.")
+    _vul_bezig = False
+
+
+def stop_alles():
+    _stop_vlag.set()
+    motors.annuleer_alle_doelen()
+
+
+# ==========================================
+# CV2 UI
+# ==========================================
+def teken_ui(glas_hoek, flesje_hoek, cam_data):
+    frame = np.zeros((380, 560, 3), dtype=np.uint8)
+
+    def t(txt, y, kleur=(220, 220, 220), schaal=0.52):
+        cv2.putText(frame, txt, (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, schaal, kleur, 1, cv2.LINE_AA)
+
+    # Titel
+    cv2.rectangle(frame, (0, 0), (560, 40), (30, 30, 30), -1)
+    cv2.putText(frame, "BIER INKAP ROBOT", (130, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 190, 255), 2, cv2.LINE_AA)
+
+    # IMU
+    t(f"Flesje (Motor 2): {flesje_hoek}°  [0° ... 50°]",  70, (180, 230, 255))
+    t(f"Glas   (Motor 3): {glas_hoek}°  [-90° ... -40°]", 100, (180, 230, 255))
+
+    # Camera
+    if cam_data['geldig']:
+        fp = round(cam_data['foam_ratio'] * 100, 1)
+        ov = "JA" if cam_data['overflow_risk'] else "nee"
+        kleur_fp = (0, 255, 100) if 15 <= fp <= 25 else (0, 120, 255)
+        t(f"Schuim: {fp}%  (ideaal 15-25%)", 140, kleur_fp)
+        t(f"Overflow risico: {ov}", 168,
+          (0, 60, 255) if cam_data['overflow_risk'] else (160, 160, 160))
+    else:
+        t("Camera: geen geldig beeld", 140, (80, 80, 80))
+
+    # Inkap status
+    status_txt = "Inkappen BEZIG" if _vul_bezig else "Wacht op 'start'"
+    status_kleur = (0, 255, 160) if _vul_bezig else (120, 120, 120)
+    t(status_txt, 210, status_kleur, schaal=0.6)
+
+    # Ingebedde camera ROI
+    roi = cam_data.get('roi_frame')
+    if roi is not None:
+        try:
+            roi_small = cv2.resize(roi, (160, 200))
+            frame[150:350, 380:540] = roi_small
+            cv2.rectangle(frame, (380, 150), (540, 350), (60, 60, 60), 1)
+            t("Camera ROI", 363, (80, 80, 80))
+        except Exception:
+            pass
+
+    # Footer
+    t("Terminal: start | stop | hoek | calibrate | exit", 345, (100, 100, 100), schaal=0.44)
+
+    return frame
+
+
+# ==========================================
+# MAIN
+# ==========================================
+def main():
+    global _stop_prog
+
+    print("=" * 55)
+    print(" BIER INKAP ROBOT — opstarten")
+    print("=" * 55)
+
+    # 1. Init
+    print("[1/4] IMUs initialiseren…")
+    imus.init_all()
+
+    print("[2/4] Motoren initialiseren…")
+    motors.init_motoren()
+    motor_thread = motors.start_motor_thread()
+
+    print("[3/4] Camera starten…")
+    camera.start_camera()
+
+    # 2. Kalibratie
+    print("[4/4] Automatische kalibratie starten…")
+    voer_kalibratie_uit(motors.pwm_motoren, motors.motor_doel, motors.doel_lock)
+
+    # 3. Input thread
+    inp.registreer_callbacks(vul_routine, stop_alles)
+    input_thread = inp.start_input_thread()
+
+    # 4. UI loop
+    cv2.namedWindow("Bier Robot", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Bier Robot", 560, 380)
+
+    print("\nSysteem klaar. Typ 'start' in de terminal om te beginnen.")
+    print("Sluit af via 'exit' in terminal of ESC in het venster.\n")
+
+    try:
+        while not _stop_prog:
+            g_hoek = imus.get_angle(imus.MPU2_ADDR)
+            f_hoek = imus.get_angle(imus.MPU1_ADDR)
+            cam    = camera.get_camera_data()
+
+            frame = teken_ui(g_hoek, f_hoek, cam)
+            cv2.imshow("Bier Robot", frame)
+
+            key = cv2.waitKey(100) & 0xFF
+            if key == 27:   # ESC
                 break
 
-except KeyboardInterrupt:
-    print("Onderbroken door gebruiker.")
+            # Stop als input-thread klaar is (exit-commando)
+            if not input_thread.is_alive():
+                break
 
-# ==========================================
-# 7. CLEANUP
-# ==========================================
-finally:
-    print("Systeem afsluiten, motoren stoppen...")
-    motor_systeem_actief = False
-    motor_statussen = {1: None, 2: None, 3: None}
-    motor_thread.join(timeout=1.0)
-    cv2.destroyAllWindows()
-    for pwm in pwm_motoren.values():
-        pwm.stop()
-    GPIO.cleanup()
-    print("GPIO succesvol opgeruimd.")
+    except KeyboardInterrupt:
+        print("\nOnderbroken door gebruiker.")
+
+    finally:
+        print("\nAfsluiten…")
+        _stop_prog = True
+        stop_alles()
+        camera.stop_camera()
+        time.sleep(0.3)
+        motors.motor_systeem_actief = False
+        motor_thread.join(timeout=1.5)
+        cv2.destroyAllWindows()
+        motors.cleanup_motoren()
+        print("Klaar. Tot de volgende pint!")
+
+
+if __name__ == '__main__':
+    main()

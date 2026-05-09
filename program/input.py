@@ -1,69 +1,143 @@
-import imus
-import motors
-import calibration
+"""
+input.py - Terminal commando-verwerking
+
+Beschikbare commando's:
+  start           → start het automatisch inkappen
+  stop            → stop / annuleer alles
+  hoek            → lees beide IMU-hoeken uit
+  calibrate       → start IMU-kalibratieprocedure
+  M2:XX M3:YY     → stel handmatig hoekdoel in per motor
+  <getal>         → stel hetzelfde hoekdoel in voor beide motoren
+  Enter (leeg)    → annuleer alle actieve doelen
+  exit / q        → programma afsluiten
+"""
+
+import threading
+from imus import (
+    MPU1_ADDR, MPU2_ADDR,
+    get_angle,
+)
+from motors import (
+    motor_doel, doel_lock, pwm_motoren,
+    stel_doel_in, annuleer_alle_doelen,
+)
+from calibration import voer_kalibratie_uit
+
+_input_actief  = True
+_vul_callback  = None   # wordt ingesteld door main.py
+_stop_callback = None
+
+
+def registreer_callbacks(vul_cb, stop_cb):
+    global _vul_callback, _stop_callback
+    _vul_callback  = vul_cb
+    _stop_callback = stop_cb
+
 
 def terminal_input_worker():
-    while motors.motor_systeem_actief:
+    global _input_actief
+
+    MENU = (
+        "\nCommando's:\n"
+        "  start           → begin automatisch inkappen\n"
+        "  stop            → stop alles\n"
+        "  hoek            → toon huidige hoeken\n"
+        "  calibrate       → IMU-kalibratie\n"
+        "  M2:XX M3:YY     → handmatige hoekdoelen\n"
+        "  <getal>         → beide motoren naar die hoek\n"
+        "  Enter           → annuleer actieve doelen\n"
+        "  exit / q        → afsluiten\n"
+        "> "
+    )
+
+    while _input_actief:
         try:
-            invoer = input(
-                "\nCommando's:\n"
-                "  • Één getal    → beide motoren naar die hoek (bijv. '30')\n"
-                "  • M2:XX M3:YY → elk een eigen hoek (bijv. 'M2:45 M3:-20')\n"
-                "  • 'hoek'       → lees huidige hoek van beide IMUs uit\n"
-                "  • 'calibrate'  → start IMU kalibratieprocedure\n"
-                "  • Enter        → annuleer alle actieve doelen\n> "
-            ).strip()
+            invoer = input(MENU).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
 
-            # Annuleer alle doelen
-            if invoer == "":
-                with motors.doel_lock:
-                    for m_id in motors.motor_doel:
-                        motors.motor_doel[m_id]['actief'] = False
-                        motors.pwm_motoren[m_id].ChangeDutyCycle(0)
-                print("Alle doelen geannuleerd.")
-                continue
+        low = invoer.lower()
 
-            # Huidige hoek uitlezen
-            if invoer.lower() == "hoek":
-                print(f"Huidige hoek IMU1 (Motor 2): {imus.get_angle(imus.MPU1_ADDR)}°")
-                print(f"Huidige hoek IMU2 (Motor 3): {imus.get_angle(imus.MPU2_ADDR)}°")
-                continue
+        # ---- Afsluiten ----
+        if low in ('exit', 'q'):
+            print("Afsluiten...")
+            _input_actief = False
+            if _stop_callback:
+                _stop_callback()
+            break
 
-            # IMU kalibratie
-            if invoer.lower() == "calibrate":
-                calibration.voer_kalibratie_uit()
-                continue
+        # ---- Leeg = annuleer ----
+        if invoer == '':
+            annuleer_alle_doelen()
+            print("Alle doelen geannuleerd.")
+            continue
 
-            doelen_parsed = {}
+        # ---- Start inkappen ----
+        if low == 'start':
+            if _vul_callback:
+                print("Inkappen gestart…")
+                threading.Thread(target=_vul_callback, daemon=True).start()
+            else:
+                print("Geen vul-callback geregistreerd.")
+            continue
 
-            if invoer.upper().startswith("M"):
+        # ---- Stop ----
+        if low == 'stop':
+            annuleer_alle_doelen()
+            if _stop_callback:
+                _stop_callback()
+            print("Gestopt.")
+            continue
+
+        # ---- Hoek uitlezen ----
+        if low == 'hoek':
+            h1 = get_angle(MPU1_ADDR)
+            h2 = get_angle(MPU2_ADDR)
+            print(f"  IMU1 (flesje / Motor 2): {h1}°")
+            print(f"  IMU2 (glas   / Motor 3): {h2}°")
+            continue
+
+        # ---- Kalibratie ----
+        if low == 'calibrate':
+            voer_kalibratie_uit(pwm_motoren, motor_doel, doel_lock)
+            continue
+
+        # ---- Handmatige hoekdoelen ----
+        if invoer.upper().startswith('M'):
+            doelen = {}
+            try:
                 for deel in invoer.split():
                     deel = deel.upper()
-                    if deel.startswith("M") and ":" in deel:
-                        m_str, h_str = deel[1:].split(":")
+                    if deel.startswith('M') and ':' in deel:
+                        m_str, h_str = deel[1:].split(':')
                         m_id = int(m_str)
-                        if m_id in motors.motor_doel:
-                            doelen_parsed[m_id] = float(h_str)
+                        if m_id in motor_doel:
+                            doelen[m_id] = stel_doel_in(m_id, float(h_str))
                         else:
-                            print(f"Motor {m_id} heeft geen IMU-koppeling, overgeslagen.")
-            else:
-                hoek = float(invoer)
-                doelen_parsed = {2: hoek, 3: hoek}
-
-            if not doelen_parsed:
-                print("Geen geldige invoer herkend.")
+                            print(f"  Motor {m_id} heeft geen IMU-koppeling.")
+            except ValueError:
+                print("  Ongeldige invoer. Voorbeeld: M2:30 M3:-70")
                 continue
 
-            with motors.doel_lock:
-                for m_id, doel in doelen_parsed.items():
-                    motors.motor_doel[m_id]['doel']   = doel
-                    motors.motor_doel[m_id]['actief'] = True
+            for m_id, doel in doelen.items():
+                imu = MPU1_ADDR if m_id == 2 else MPU2_ADDR
+                print(f"  [Motor {m_id}] → {doel}° | huidig: {get_angle(imu)}°")
+            continue
 
-            for m_id, doel in doelen_parsed.items():
-                huidige_hoek = imus.get_angle(imus.MPU1_ADDR if m_id == 2 else imus.MPU2_ADDR)
-                print(f"[Motor {m_id}] Naar {doel}° | Huidige hoek: {huidige_hoek}°")
-
+        # ---- Enkelvoudig getal → beide motoren ----
+        try:
+            hoek = float(invoer)
+            d2 = stel_doel_in(2, hoek)
+            d3 = stel_doel_in(3, hoek)
+            print(f"  Motor 2 → {d2}° | Motor 3 → {d3}°")
+            continue
         except ValueError:
-            print("Ongeldige invoer, probeer opnieuw (bijv. '30' of 'M2:45 M3:-20').")
-        except EOFError:
-            break
+            pass
+
+        print("  Onbekend commando. Typ Enter om het menu te zien.")
+
+
+def start_input_thread():
+    t = threading.Thread(target=terminal_input_worker, daemon=True)
+    t.start()
+    return t
