@@ -239,7 +239,7 @@ MIN_DC = {
 }
 
 # PI Parameters
-KP = 5   # Iets verhoogd voor snellere reactie
+KP = 10   # Iets verhoogd voor snellere reactie
 KI = 0.9   # 0.5 De integraal-factor: bouwt kracht op als het doel niet bereikt wordt
 MAX_I = 15 # Anti-windup: de maximale bijdrage van de I-term aan de duty cycle
 
