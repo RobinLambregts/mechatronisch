@@ -291,6 +291,7 @@ def _analyseer_frame(frame):
             2
         )
 
+        cv2.namedWindow("LIVE CAMERA", cv2.WINDOW_NORMAL)
         cv2.imshow("LIVE CAMERA", live_frame)
         cv2.waitKey(1)
 
