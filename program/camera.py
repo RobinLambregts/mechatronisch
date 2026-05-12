@@ -47,6 +47,7 @@ _data = {
     'bier_grens_px':    None,
     'vloeistof_bot_px': None,
     'roi_frame':        None,
+    'live_frame':       None,
     'geldig':           False,
 }
 
@@ -170,6 +171,7 @@ def _analyseer_frame(frame):
     )
 
     roi_vis = roi.copy()
+    live_frame = frame.copy()
 
     vloeistof_bot, canny_masker = _vind_bodem_via_canny(
         roi_grijs,
@@ -291,7 +293,6 @@ def _analyseer_frame(frame):
             2
         )
 
-        cv2.namedWindow("LIVE CAMERA", cv2.WINDOW_NORMAL)
         cv2.imshow("LIVE CAMERA", live_frame)
         cv2.waitKey(1)
 
@@ -377,13 +378,14 @@ def _analyseer_frame(frame):
         cv2.waitKey(1)
 
     return (
-        foam_ratio,
-        overflow,
-        schuim_top,
-        bier_grens,
-        vloeistof_bot,
-        roi_vis
-    )
+    foam_ratio,
+    overflow,
+    schuim_top,
+    bier_grens,
+    vloeistof_bot,
+    roi_vis,
+    live_frame
+)
 
 
 # ==========================================
@@ -415,7 +417,7 @@ def _camera_worker():
 
         try:
 
-            foam_ratio, overflow, st, bg, vb, roi_vis = _analyseer_frame(frame)
+            foam_ratio, overflow, st, bg, vb, roi_vis, live_frame = _analyseer_frame(frame)
 
         except Exception as e:
 
@@ -432,6 +434,7 @@ def _camera_worker():
             _data['vloeistof_bot_px'] = vb
             _data['roi_frame']        = roi_vis
             _data['geldig']           = st is not None
+            _data['live_frame'] = live_frame
 
         time.sleep(0.05)
 

@@ -203,13 +203,23 @@ def teken_ui(glas_hoek, flesje_hoek, cam_data):
     t(status_txt, 210, status_kleur, schaal=0.6)
 
     # Ingebedde camera ROI
-    roi = cam_data.get('roi_frame')
-    if roi is not None:
+    live = cam_data.get('live_frame')
+
+    if live is not None:
         try:
-            roi_small = cv2.resize(roi, (160, 200))
-            frame[150:350, 380:540] = roi_small
-            cv2.rectangle(frame, (380, 150), (540, 350), (60, 60, 60), 1)
-            t("Camera ROI", 363, (80, 80, 80))
+            live_small = cv2.resize(live, (220, 165))
+            frame[150:315, 320:540] = live_small
+
+            cv2.rectangle(
+                frame,
+                (320, 150),
+                (540, 315),
+                (60, 60, 60),
+                1
+            )
+
+            t("Live camera", 335, (80, 80, 80))
+
         except Exception:
             pass
 
