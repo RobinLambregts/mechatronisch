@@ -105,57 +105,87 @@ def _vind_bodem_via_canny(roi_grijs, roi_breedte):
 # ==========================================
 # STAP 2: Helderheidssprong
 # ==========================================
-def _vind_schuim_grens(roi_grijs, y_top, y_bot):
+def _vind_schuim_grens(roi_bgr, y_top, y_bot):
+    """
+    Detecteert schuim puur op basis van witte kleur.
+    Werkt veel beter voor plastic bekers.
+    """
 
-    if y_bot <= y_top + MIN_SCHUIM_RIJEN * 2:
+    if y_bot <= y_top + MIN_SCHUIM_RIJEN:
         return y_top, y_bot
 
-    strook = roi_grijs[y_top:y_bot, :]
+    strook = roi_bgr[y_top:y_bot, :]
 
-    profiel = np.mean(strook, axis=1).astype(float)
+    # ==========================================
+    # HSV conversie
+    # ==========================================
+    hsv = cv2.cvtColor(strook, cv2.COLOR_BGR2HSV)
 
-    venster = SPRONG_VENSTER
+    # ==========================================
+    # Wit detecteren
+    #
+    # Lage saturatie + hoge helderheid
+    # ==========================================
+    lower_white = np.array([0, 0, 170])
+    upper_white = np.array([180, 70, 255])
 
-    profiel_glad = np.convolve(
-        profiel,
-        np.ones(venster) / venster,
-        mode='valid'
+    wit_mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # Ruis verwijderen
+    kernel = np.ones((3, 3), np.uint8)
+
+    wit_mask = cv2.morphologyEx(
+        wit_mask,
+        cv2.MORPH_OPEN,
+        kernel
     )
 
-    offset = venster // 2
+    wit_mask = cv2.morphologyEx(
+        wit_mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
 
-    beste_sprong = 0
-    beste_y = None
+    # ==========================================
+    # Percentage witte pixels per rij
+    # ==========================================
+    wit_per_rij = np.mean(wit_mask > 0, axis=1)
 
-    for i in range(1, len(profiel_glad)):
+    # Rij is schuim als voldoende wit
+    WIT_DREMPEL = 0.35
 
-        sprong = profiel_glad[i - 1] - profiel_glad[i]
+    schuim_rijen = wit_per_rij > WIT_DREMPEL
 
-        if sprong > beste_sprong and sprong >= SPRONG_DREMPEL:
-            beste_sprong = sprong
-            beste_y = i + offset
+    # ==========================================
+    # Zoek onderste schuimrij
+    # ==========================================
+    bier_grens = y_top
 
-    if beste_y is None:
-        bier_grens = y_top + int((y_bot - y_top) * 0.80)
-    else:
-        bier_grens = y_top + beste_y
+    gevonden = False
 
-    drempel_helderheid = profiel_glad[
-        min(
-            beste_y or len(profiel_glad) - 1,
-            len(profiel_glad) - 1
-        )
-    ] + SPRONG_DREMPEL
+    for i in range(len(schuim_rijen) - 1, -1, -1):
 
-    schuim_top = y_top
+        if schuim_rijen[i]:
+            bier_grens = y_top + i
+            gevonden = True
+            break
 
-    for i, h in enumerate(profiel_glad):
-        if h >= drempel_helderheid:
-            schuim_top = y_top + i + offset
+    if not gevonden:
+        # Geen schuim gevonden
+        return y_top, y_top
+
+    # ==========================================
+    # Zoek bovenste schuimrij
+    # ==========================================
+    schuim_top = bier_grens
+
+    for i in range(len(schuim_rijen)):
+
+        if schuim_rijen[i]:
+            schuim_top = y_top + i
             break
 
     return schuim_top, bier_grens
-
 
 # ==========================================
 # Analyse per frame
@@ -192,7 +222,7 @@ def _analyseer_frame(frame):
     y_analyse_bot = vloeistof_bot
 
     schuim_top, bier_grens = _vind_schuim_grens(
-        roi_grijs,
+        roi,
         y_analyse_top,
         y_analyse_bot
     )
