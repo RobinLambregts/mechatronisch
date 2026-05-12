@@ -230,7 +230,7 @@ config = {
     3: {'dir': 20, 'pulse': 21}
 }
 
-PWM_FREQ = 40
+PWM_FREQ = 100
 TOLERANTIE = 1.0
 MAX_DC = 40
 MIN_DC = {
