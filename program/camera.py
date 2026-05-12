@@ -1,26 +1,25 @@
 """
-camera.py - Schuimdetectie voor semi-doorzichtige plastic beker
-Gecorrigeerd: UI-vrij voor betere stabiliteit in threads.
+camera.py - Schuimdetectie voor Raspberry Pi Camera (Picamera2)
+===============================================================
 """
 
 import cv2
 import numpy as np
 import threading
 import time
+from picamera2 import Picamera2 # Belangrijk!
 
 # ==========================================
 # Instellingen
 # ==========================================
-CAMERA_INDEX = 0
-FRAME_WIDTH  = 640
-FRAME_HEIGHT = 480
+FRAME_WIDTH  = 320
+FRAME_HEIGHT = 240
+ROI = (40, 20, 240, 200) # Aangepast op kleinere resolutie
 
-ROI = (160, 50, 320, 400)
-
-CANNY_LAAG        = 25
-CANNY_HOOG        = 75
+CANNY_LAAG        = 20
+CANNY_HOOG        = 60
 BLUR_KERNEL       = 5
-MIN_RAND_BREEDTE  = 0.35
+MIN_RAND_BREEDTE  = 0.25
 
 SPRONG_VENSTER    = 5
 SPRONG_DREMPEL    = 12
@@ -47,8 +46,10 @@ _data = {
 }
 
 _actief = False
-_cap = None
 
+# ==========================================
+# Hulpmiddelen (Bodem & Schuim)
+# ==========================================
 def _vind_bodem_via_canny(roi_grijs, roi_breedte):
     blurred = cv2.GaussianBlur(roi_grijs, (BLUR_KERNEL, BLUR_KERNEL), 0)
     randen = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
@@ -60,28 +61,23 @@ def _vind_bodem_via_canny(roi_grijs, roi_breedte):
         if int(np.sum(randen[y] > 0)) >= min_px:
             kandidaten.append(y)
 
-    if not kandidaten:
-        return None, randen
+    if not kandidaten: return None, randen
 
     groepen = []
     huidige = [kandidaten[0]]
     for y in kandidaten[1:]:
-        if y - huidige[-1] <= 12:
-            huidige.append(y)
+        if y - huidige[-1] <= 12: huidige.append(y)
         else:
             groepen.append(huidige)
             huidige = [y]
     groepen.append(huidige)
-    bodem = int(np.mean(groepen[-1]))
-    return bodem, randen
+    return int(np.mean(groepen[-1])), randen
 
 def _vind_schuim_grens(roi_grijs, y_top, y_bot):
-    if y_bot <= y_top + MIN_SCHUIM_RIJEN * 2:
-        return y_top, y_bot
-
+    if y_bot <= y_top + MIN_SCHUIM_RIJEN * 2: return y_top, y_bot
     strook = roi_grijs[y_top:y_bot, :]
     profiel = np.mean(strook, axis=1).astype(float)
-    venster = SPRONG_VENSTER
+    venster = SPRORM_VENSTER = 5
     profiel_glad = np.convolve(profiel, np.ones(venster) / venster, mode='valid')
     offset = venster // 2
 
@@ -93,10 +89,8 @@ def _vind_schuim_grens(roi_grijs, y_top, y_bot):
             beste_sprong = sprong
             beste_y = i + offset
 
-    if beste_y is None:
-        bier_grens = y_top + int((y_bot - y_top) * 0.80)
-    else:
-        bier_grens = y_top + beste_y
+    if beste_y is None: bier_grens = y_top + int((y_bot - y_top) * 0.80)
+    else: bier_grens = y_top + beste_y
 
     drempel_helderheid = profiel_glad[min(beste_y or len(profiel_glad)-1, len(profiel_glad)-1)] + SPRONG_DREMPEL
     schuim_top = y_top
@@ -104,9 +98,11 @@ def _vind_schuim_grens(roi_grijs, y_top, y_bot):
         if h >= drempel_helderheid:
             schuim_top = y_top + i + offset
             break
-
     return schuim_top, bier_grens
 
+# ==========================================
+# Analyse Functie
+# ==========================================
 def _analyseer_frame(frame):
     x, y, w, h = ROI
     roi = frame[y:y+h, x:x+w]
@@ -115,9 +111,11 @@ def _analyseer_frame(frame):
     
     vloeistof_bot, _ = _vind_bodem_via_canny(roi_grijs, w)
 
-    # Fallback als er geen beker gevonden wordt
     if vloeistof_bot is None:
-        return 0.0, False, None, None, None, roi_vis, frame
+        # Altijd een live_frame teruggeven voor de UI
+        live_f = frame.copy()
+        cv2.rectangle(live_f, (x,y), (x+w, y+h), (0,0,255), 1)
+        return 0.0, False, None, None, None, roi_vis, live_f
 
     y_analyse_top = max(0, int(vloeistof_bot * 0.05))
     y_analyse_bot = vloeistof_bot
@@ -128,34 +126,40 @@ def _analyseer_frame(frame):
     foam_ratio = max(0.0, min(1.0, schuim_hoogte / totale_hoogte)) if totale_hoogte > MIN_SCHUIM_RIJEN else 0.0
     overflow = schuim_top < int(h * OVERFLOW_DREMPEL)
 
-    # Teken lijnen op de ROI voor de UI
+    # Tekenen voor UI
     cv2.line(roi_vis, (0, schuim_top), (w, schuim_top), (255, 255, 255), 2)
     cv2.line(roi_vis, (0, bier_grens), (w, bier_grens), (0, 180, 255), 2)
     cv2.line(roi_vis, (0, vloeistof_bot), (w, vloeistof_bot), (0, 255, 80), 2)
 
-    # Maak het live_frame klaar voor main.py
     live_frame = frame.copy()
     cv2.rectangle(live_frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
     live_frame[y:y+h, x:x+w] = roi_vis
 
     return foam_ratio, overflow, schuim_top, bier_grens, vloeistof_bot, roi_vis, live_frame
 
+# ==========================================
+# Camera Worker (Picamera2 versie)
+# ==========================================
 def _camera_worker():
-    global _cap, _actief
-    _cap = cv2.VideoCapture(CAMERA_INDEX)
-    _cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    _cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    if not _cap.isOpened():
-        print("CAMERA: kon camera niet openen!")
-        _actief = False
-        return
+    global _actief
+    
+    print("Camera initialiseren via Picamera2...")
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"}
+    )
+    picam2.configure(config)
+    picam2.set_controls({"AwbEnable": True})
+    picam2.start()
+    
+    time.sleep(1.0) # Opwarmtijd
 
     while _actief:
-        ret, frame = _cap.read()
-        if not ret:
-            time.sleep(0.05)
-            continue
+        # Capture frame (geeft RGB array)
+        frame_rgb = picam2.capture_array()
+        
+        # Picamera geeft RGB, OpenCV UI wil BGR
+        frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
         try:
             res = _analyseer_frame(frame)
@@ -169,18 +173,21 @@ def _camera_worker():
                 _data['live_frame']       = res[6]
                 _data['geldig']           = res[2] is not None
         except Exception as e:
-            print(f"Camera analysefout: {e}")
-        
-        time.sleep(0.03)
+            print(f"Analysefout: {e}")
 
-    _cap.release()
+        time.sleep(0.01)
 
+    picam2.stop()
+    print("Camera gestopt.")
+
+# ==========================================
+# API
+# ==========================================
 def start_camera():
     global _actief
     _actief = True
     t = threading.Thread(target=_camera_worker, daemon=True)
     t.start()
-    time.sleep(1.0)
     return t
 
 def stop_camera():
@@ -188,8 +195,7 @@ def stop_camera():
     _actief = False
 
 def get_camera_data():
-    with _lock:
-        return _data.copy()
+    with _lock: return _data.copy()
 
 def schuim_actie():
     data = get_camera_data()
