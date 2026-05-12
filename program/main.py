@@ -1,6 +1,6 @@
 """
 main.py - Bier inkap robot
-Gecorrigeerd: Bevat de centrale UI-loop op de Main Thread.
+Met extra venster voor direct camerabeeld.
 """
 
 import time
@@ -55,9 +55,6 @@ def vul_routine():
             huidige_glas_hoek = max(huidige_glas_hoek - GLAS_STAP_KLEIN, GLAS_MIN)
             motors.stel_doel_in(3, huidige_glas_hoek)
         
-        if cam['geldig'] and cam['foam_ratio'] < 0.01: # Versimpelde check voor 'leeg'
-             pass 
-
         time.sleep(CAMERA_CHECK_INTERVAL)
 
     motors.stel_doel_in(2, FLESJE_START)
@@ -83,23 +80,24 @@ def teken_ui(glas_hoek, flesje_hoek, cam_data):
 
     if cam_data['geldig']:
         fp = round(cam_data['foam_ratio'] * 100, 1)
-        t(f"Schuim: {fp}%", 140, (0, 255, 100))
+        t(f"Schuim detectie: {fp}%", 140, (0, 255, 100))
     else:
-        t("Camera: Zoeken naar beker...", 140, (0, 0, 255))
+        t("Camera: BEKER NIET GEVONDEN", 140, (0, 0, 255))
 
-    # Live video in de UI plaatsen
+    # Kleine preview in het hoofdscherm
     live = cam_data.get('live_frame')
     if live is not None:
         try:
             live_small = cv2.resize(live, (220, 165))
             frame[150:315, 320:540] = live_small
-            cv2.rectangle(frame, (320, 150), (540, 315), (200, 200, 200), 1)
+            cv2.rectangle(frame, (320, 150), (540, 315), (255, 255, 255), 1)
         except: pass
 
     return frame
 
 def main():
     global _stop_prog
+    print("Systeem opstarten...")
     imus.init_all()
     motors.init_motoren()
     motor_thread = motors.start_motor_thread()
@@ -108,7 +106,9 @@ def main():
     inp.registreer_callbacks(vul_routine, stop_alles)
     input_thread = inp.start_input_thread()
 
-    cv2.namedWindow("Bier Robot")
+    # Vensters aanmaken
+    cv2.namedWindow("Bier Robot", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("LIVE FEED", cv2.WINDOW_NORMAL) # EXTRA VENSTER
 
     try:
         while not _stop_prog:
@@ -116,10 +116,21 @@ def main():
             f_hoek = imus.get_angle(imus.MPU1_ADDR) or 0
             cam    = camera.get_camera_data()
 
+            # 1. Teken de UI
             ui_frame = teken_ui(g_hoek, f_hoek, cam)
             cv2.imshow("Bier Robot", ui_frame)
 
-            if cv2.waitKey(30) & 0xFF == 27: # ESC om te stoppen
+            # 2. Toon de LIVE FEED (als deze bestaat)
+            if cam['live_frame'] is not None:
+                cv2.imshow("LIVE FEED", cam['live_frame'])
+            else:
+                # Als er echt geen beeld is, toon een zwart beeld met tekst
+                black = np.zeros((480, 640, 3), np.uint8)
+                cv2.putText(black, "GEEN CAMERABEELD", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+                cv2.imshow("LIVE FEED", black)
+
+            # Belangrijk: waitKey verwerkt de beelden
+            if cv2.waitKey(30) & 0xFF == 27: # ESC
                 break
             
             if not input_thread.is_alive(): break
