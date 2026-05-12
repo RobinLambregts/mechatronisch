@@ -57,7 +57,7 @@ IDEAAL_SCHUIM_MIN = 0.15
 IDEAAL_SCHUIM_MAX = 0.25
 OVERFLOW_DREMPEL  = 0.05   # bovenste X% van ROI = overflow
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 # ==========================================
 # Gedeelde toestand
