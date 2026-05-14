@@ -1,8 +1,8 @@
 """
 motors.py - GPIO motor aansturing (3 stappenm/DC motoren via PWM)
 
-Motor 1: draaien flesje   (geen IMU, handmatig — flesje-IMU kapot)
-Motor 2: UITGESCHAKELD    (IMU kapot, flesje wordt manueel bediend)
+Motor 1: draaien flesje   (geen IMU, handmatig)
+Motor 2: draaien glas     (IMU1 / MPU1_ADDR)  — bereik: 0° … 50°
 Motor 3: voor/achteruit glas (IMU2 / MPU2_ADDR) — bereik: -90° … -40°
 """
 
@@ -11,7 +11,7 @@ import threading
 import RPi.GPIO as GPIO
 
 from imus import (
-    MPU2_ADDR,
+    MPU1_ADDR, MPU2_ADDR,
     get_angle, angle_difference,
 )
 
@@ -30,9 +30,10 @@ CONFIG = {
 PWM_FREQ = 40
 TOLERANTIE = 1.0       # graden
 MAX_DC     = 40        # maximale duty cycle %
-MIN_DC     = {3: 0}
+MIN_DC     = {2: 0, 3: 0}
 
 # ---- Hoekgrenzen ----
+GRENS_FLESJE = (0.0, 50.0)     # Motor 2
 GRENS_GLAS   = (-90.0, -40.0)  # Motor 3
 
 # ---- PI parameters ----
@@ -40,13 +41,14 @@ KP    = 5.0
 KI    = 0.2
 MAX_I = 15.0
 
-IMU_MOTOR_MAP = {MPU2_ADDR: 3}
+IMU_MOTOR_MAP = {MPU1_ADDR: 2, MPU2_ADDR: 3}
 
 # ==========================================
 # Gedeelde toestand
 # ==========================================
 pwm_motoren = {}
 motor_doel = {
+    2: {'doel': None, 'actief': False},
     3: {'doel': None, 'actief': False},
 }
 motor_statussen = {1: None, 2: None, 3: None}   # handmatige sturing
@@ -54,6 +56,7 @@ doel_lock = threading.Lock()
 laatste_toets_tijd = time.time()
 
 pi_staat = {
+    2: {'integraal': 0.0, 'vorige_tijd': None},
     3: {'integraal': 0.0, 'vorige_tijd': None},
 }
 
@@ -111,7 +114,9 @@ def _reset_pi(m_id):
 # Hoekgrenzen bewaking
 # ==========================================
 def klamp_doel(m_id, doel):
-    if m_id == 3:
+    if m_id == 2:
+        lo, hi = GRENS_FLESJE
+    elif m_id == 3:
         lo, hi = GRENS_GLAS
     else:
         return doel

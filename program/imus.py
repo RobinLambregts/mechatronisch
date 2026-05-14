@@ -89,4 +89,4 @@ def get_both_angles():
 
 def init_all():
     init_mpu(MPU1_ADDR)
-    init_mpu(MPU2_ADDR)
+#    init_mpu(MPU2_ADDR)
