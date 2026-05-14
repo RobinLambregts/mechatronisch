@@ -14,7 +14,7 @@ Beschikbare commando's:
 
 import threading
 from imus import (
-    MPU1_ADDR, MPU2_ADDR,
+    MPU2_ADDR,
     get_angle,
 )
 from motors import (
@@ -91,10 +91,8 @@ def terminal_input_worker():
 
         # ---- Hoek uitlezen ----
         if low == 'hoek':
-            h1 = get_angle(MPU1_ADDR)
             h2 = get_angle(MPU2_ADDR)
-            print(f"  IMU1 (flesje / Motor 2): {h1}°")
-            print(f"  IMU2 (glas   / Motor 3): {h2}°")
+            print(f"  IMU2 (glas / Motor 3): {h2}°")
             continue
 
         # ---- Kalibratie ----
@@ -102,7 +100,7 @@ def terminal_input_worker():
             voer_kalibratie_uit(pwm_motoren, motor_doel, doel_lock)
             continue
 
-        # ---- Handmatige hoekdoelen ----
+        # ---- Handmatige hoekdoelen (alleen Motor 3) ----
         if invoer.upper().startswith('M'):
             doelen = {}
             try:
@@ -111,25 +109,26 @@ def terminal_input_worker():
                     if deel.startswith('M') and ':' in deel:
                         m_str, h_str = deel[1:].split(':')
                         m_id = int(m_str)
+                        if m_id == 2:
+                            print("  Motor 2 (flesje) is uitgeschakeld — IMU kapot.")
+                            continue
                         if m_id in motor_doel:
                             doelen[m_id] = stel_doel_in(m_id, float(h_str))
                         else:
                             print(f"  Motor {m_id} heeft geen IMU-koppeling.")
             except ValueError:
-                print("  Ongeldige invoer. Voorbeeld: M2:30 M3:-70")
+                print("  Ongeldige invoer. Voorbeeld: M3:-70")
                 continue
 
             for m_id, doel in doelen.items():
-                imu = MPU1_ADDR if m_id == 2 else MPU2_ADDR
-                print(f"  [Motor {m_id}] → {doel}° | huidig: {get_angle(imu)}°")
+                print(f"  [Motor {m_id}] → {doel}° | huidig: {get_angle(MPU2_ADDR)}°")
             continue
 
-        # ---- Enkelvoudig getal → beide motoren ----
+        # ---- Enkelvoudig getal → alleen Motor 3 ----
         try:
             hoek = float(invoer)
-            d2 = stel_doel_in(2, hoek)
             d3 = stel_doel_in(3, hoek)
-            print(f"  Motor 2 → {d2}° | Motor 3 → {d3}°")
+            print(f"  Motor 3 → {d3}°  (Motor 2 manueel)")
             continue
         except ValueError:
             pass

@@ -1,6 +1,6 @@
 """
-calibration.py - Kalibratieprocedure voor beide IMUs
-  Flesje (MPU1 / Motor 2) -> 0°
+calibration.py - Kalibratieprocedure voor IMU2 (glas)
+  Flesje (Motor 2) wordt manueel bediend — IMU kapot, geen kalibratie
   Glas   (MPU2 / Motor 3) -> -90°
 """
 
@@ -8,7 +8,7 @@ import time
 import math
 
 from imus import (
-    MPU1_ADDR, MPU2_ADDR,
+    MPU2_ADDR,
     imu_offsets, imu_state,
     read_word, get_angle,
 )
@@ -59,39 +59,36 @@ def kalibreer_imu(addr, target_angle=0, num_samples=200, vertraging=0.01):
 
 def voer_kalibratie_uit(pwm_motoren, motor_doel, doel_lock):
     """
-    Volledige kalibratie: stop alle motoren, wacht 3 s, meet offsets.
-    Roept de kalibratiefunctie aan voor flesje (0°) en glas (-90°).
+    Kalibratie alleen voor IMU2 (glas / Motor 3).
+    Motor 2 (flesje) wordt manueel bediend — IMU1 is kapot.
     """
     print("\n" + "=" * 50)
-    print("IMU KALIBRATIE GESTART")
+    print("IMU KALIBRATIE GESTART  (alleen glas / Motor 3)")
     print("=" * 50)
     print("Zorg dat:")
-    print("  • Flesje HORIZONTAAL staat  (Motor 2 = 0°)")
-    print("  • Glas   VERTICAAL staat    (Motor 3 = -90°)")
+    print("  • Glas VERTICAAL staat  (Motor 3 = -90°)")
+    print("  • Flesje wordt manueel bediend (Motor 2 niet actief)")
     print("Wacht 3 seconden…")
 
-    # Stop alle motoren
+    # Stop alleen Motor 3
     with doel_lock:
-        for m_id in motor_doel:
-            motor_doel[m_id]['actief'] = False
-            pwm_motoren[m_id].ChangeDutyCycle(0)
+        if 3 in motor_doel:
+            motor_doel[3]['actief'] = False
+            pwm_motoren[3].ChangeDutyCycle(0)
 
     for i in range(3, 0, -1):
         print(f"  {i}…", end='', flush=True)
         time.sleep(1)
     print()
 
-    ok1 = kalibreer_imu(MPU1_ADDR, target_angle=45)
     ok2 = kalibreer_imu(MPU2_ADDR, target_angle=-90)
 
     print()
-    if ok1 and ok2:
+    if ok2:
         print("✓ Kalibratie geslaagd.")
-        h1 = get_angle(MPU1_ADDR)
         h2 = get_angle(MPU2_ADDR)
-        print(f"  IMU1 (flesje / Motor 2): {h1}°  (verwacht ≈ 45°)")
-        print(f"  IMU2 (glas   / Motor 3): {h2}°  (verwacht ≈ -90°)")
+        print(f"  IMU2 (glas / Motor 3): {h2}°  (verwacht ≈ -90°)")
     else:
-        print("✗ Kalibratie deels mislukt — controleer IMU-verbindingen.")
+        print("✗ Kalibratie mislukt — controleer IMU2-verbinding.")
     print("=" * 50 + "\n")
-    return ok1 and ok2
+    return ok2
