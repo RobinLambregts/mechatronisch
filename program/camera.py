@@ -35,8 +35,8 @@ BLUR_KERNEL   = 5
 MIN_RAND_FRAC = 0.30
 
 # --- Schuim detectie ---
-SCHUIM_S_MAX = 110
-SCHUIM_V_MIN = 110
+SCHUIM_S_MAX    = 80
+SCHUIM_V_MIN    = 150
 SCHUIM_MIN_FRAC = 0.20
 
 # --- Morfologie ---
