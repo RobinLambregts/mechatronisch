@@ -81,7 +81,7 @@ def voer_kalibratie_uit(pwm_motoren, motor_doel, doel_lock):
         time.sleep(1)
     print()
 
-    ok1 = kalibreer_imu(MPU1_ADDR, target_angle=0)
+    ok1 = kalibreer_imu(MPU1_ADDR, target_angle=45)
     ok2 = kalibreer_imu(MPU2_ADDR, target_angle=-90)
 
     print()
