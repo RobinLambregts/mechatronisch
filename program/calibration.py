@@ -89,7 +89,7 @@ def voer_kalibratie_uit(pwm_motoren, motor_doel, doel_lock):
         print("✓ Kalibratie geslaagd.")
         h1 = get_angle(MPU1_ADDR)
         h2 = get_angle(MPU2_ADDR)
-        print(f"  IMU1 (flesje / Motor 2): {h1}°  (verwacht ≈ 0°)")
+        print(f"  IMU1 (flesje / Motor 2): {h1}°  (verwacht ≈ 45°)")
         print(f"  IMU2 (glas   / Motor 3): {h2}°  (verwacht ≈ -90°)")
     else:
         print("✗ Kalibratie deels mislukt — controleer IMU-verbindingen.")
