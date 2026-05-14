@@ -138,7 +138,7 @@ def _vind_glasbodem(roi_grijs, roi_breedte, roi_hoogte):
 def _vind_schuim_grenzen(roi_bgr, y_top, y_bot):
 
     if y_bot <= y_top + MIN_ZONE_RIJEN:
-        return None, None
+        return y_top, y_top
 
     strook = roi_bgr[y_top:y_bot, :]
 
@@ -163,7 +163,9 @@ def _vind_schuim_grenzen(roi_bgr, y_top, y_bot):
     )
 
     breedte = strook.shape[1]
-    min_px  = int(breedte * SCHUIM_MIN_FRAC)
+
+    # VEEL minder streng
+    min_px = int(breedte * 0.08)
 
     wit_per_rij = np.sum(wit_mask > 0, axis=1)
 
@@ -176,8 +178,9 @@ def _vind_schuim_grenzen(roi_bgr, y_top, y_bot):
             schuim_top = y_top + i
             break
 
+    # GEEN schuim gevonden
     if schuim_top is None:
-        return None, None
+        return y_top, y_top
 
     bier_grens = schuim_top
 
@@ -187,7 +190,6 @@ def _vind_schuim_grenzen(roi_bgr, y_top, y_bot):
             break
 
     return schuim_top, bier_grens
-
 
 # ==========================================
 # Analyse per frame
