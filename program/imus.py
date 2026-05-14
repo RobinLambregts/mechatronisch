@@ -68,7 +68,7 @@ def get_angle(addr):
         return round(angle, 2)
 
     except Exception as e:
-        print(f"IMU {hex(addr)} leesfout: {e}")
+#        print(f"IMU {hex(addr)} leesfout: {e}")
         return None
 
 
