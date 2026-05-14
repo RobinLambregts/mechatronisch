@@ -1,15 +1,23 @@
 """
 camera.py - Schuimdetectie met Picamera2
 =========================================
-Driezone segmentatie:
-  Zone 1 (boven)  — SCHUIM  : wit/lichtgrijs  (hoge V, lage S)
-  Zone 2 (midden) — BIER    : geel/bruin       (H 15-35, matige S)
-  Zone 3 (onder)  — ACHTERGROND: donkerst       (lage V)
+Strategie (kleurkleuronafhankelijk):
 
-Change-detection: vergelijkt schuim_hoogte_px en bier_hoogte_px
-met de vorige meting. Als de waarden niet veranderen → signaal
-dat het flesje verder mag kantelen. Als ze wél veranderen →
-flesje stilhouden en glas bijsturen.
+  1. GLASBODEM  – Canny op het grijskanaal, zoekt de onderste
+                  horizontale rand van het glas (betrouwbaar,
+                  ongeacht bierkleur).
+
+  2. SCHUIM     – HSV wit-masker (lage saturatie, hoge helderheid)
+                  van boven naar de glasbodem. Onderste schuimrij
+                  = bier_grens.
+
+  3. BIER       – Alles tussen bier_grens en glasbodem.
+                  Geen kleurassumptie nodig.
+
+Drie zones in de visualisatie:
+  Wit/lichtblauw = schuim
+  Amber          = bier
+  Onveranderd    = achtergrond buiten glas
 """
 
 import cv2
@@ -27,35 +35,30 @@ FRAME_HEIGHT = 480
 # ROI rond het glas (x, y, breedte, hoogte)
 ROI = (160, 50, 320, 400)
 
-# --- Driezone HSV drempels ---
-# Schuim: wit → lage saturatie, hoge helderheid
-SCHUIM_S_MAX = 70
-SCHUIM_V_MIN = 160
+# --- Glasbodem detectie (Canny) ---
+CANNY_LAAG    = 20
+CANNY_HOOG    = 60
+BLUR_KERNEL   = 5
+MIN_RAND_FRAC = 0.30   # min 30% van ROI-breedte moet rand zijn
 
-# Bier: geel/amber/bruin → hue 10-35, matige saturatie
-BIER_H_MIN   = 10
-BIER_H_MAX   = 35
-BIER_S_MIN   = 50
-BIER_V_MIN   = 60
+# --- Schuim (wit/lichtgrijs) ---
+SCHUIM_S_MAX    = 80   # max saturatie (0-255)
+SCHUIM_V_MIN    = 150  # min helderheid (0-255)
+SCHUIM_MIN_FRAC = 0.20 # min fractie breedte per rij om als schuimrij te tellen
 
-# Achtergrond: alles wat niet schuim of bier is én donker genoeg
-ACHTER_V_MAX = 100
-
-# Minimaal aantal rijen voor een zone om geldig te zijn
-MIN_ZONE_RIJEN = 5
-
-# Ruis-morfologie kernel
-MORPH_KERNEL = np.ones((5, 5), np.uint8)
+# --- Morfologie ---
+MORPH_K3 = np.ones((3, 3), np.uint8)
+MORPH_K5 = np.ones((5, 5), np.uint8)
 
 # --- Schuimnormen ---
 IDEAAL_SCHUIM_MIN = 0.15
 IDEAAL_SCHUIM_MAX = 0.25
-OVERFLOW_DREMPEL  = 0.05   # fractie van ROI-hoogte
+OVERFLOW_DREMPEL  = 0.05  # schuim_top < 5% ROI-hoogte = overflow
 
-# --- Change detection ---
-# Minimale pixelverandering om als "veranderd" te beschouwen
+MIN_ZONE_RIJEN = 6
+
+# --- Change-detection ---
 CHANGE_DREMPEL_PX = 8
-# Aantal frames stabiel voor "niet veranderd" conclusie
 STABIEL_FRAMES    = 4
 
 DEBUG_MODE = False
@@ -66,125 +69,105 @@ DEBUG_MODE = False
 _lock = threading.Lock()
 
 _data = {
-    'foam_ratio':        0.0,   # schuim / (schuim + bier)
+    'foam_ratio':        0.0,
     'overflow_risk':     False,
-    'schuim_hoogte_px':  0,     # pixels schuimzone
-    'bier_hoogte_px':    0,     # pixels bierzone
-    'achter_hoogte_px':  0,     # pixels achtergrond (onderaan)
-    'schuim_top_px':     None,  # absolute y in ROI
-    'bier_grens_px':     None,  # grens schuim/bier in ROI
-    'vloeistof_bot_px':  None,  # onderkant vloeistof in ROI
-    'schuim_veranderd':  False, # True als schuim significant verschoven
-    'bier_veranderd':    False, # True als bier significant verschoven
+    'schuim_hoogte_px':  0,
+    'bier_hoogte_px':    0,
+    'schuim_top_px':     None,
+    'bier_grens_px':     None,
+    'vloeistof_bot_px':  None,
+    'schuim_veranderd':  False,
+    'bier_veranderd':    False,
     'roi_frame':         None,
     'geldig':            False,
 }
 
-_actief   = False
-_picam2   = None
-
-# Vorige waarden voor change-detection
+_actief          = False
+_picam2          = None
 _vorige_schuim_h = 0
 _vorige_bier_h   = 0
 _stabiel_teller  = 0
 
 
 # ==========================================
-# Driezone segmentatie
+# Stap 1: Glasbodem via Canny
 # ==========================================
-def _segmenteer_zones(roi_bgr):
+def _vind_glasbodem(roi_grijs, roi_breedte, roi_hoogte):
     """
-    Geeft drie maskers terug: schuim, bier, achtergrond.
-    Werkt puur op kleur (HSV), geen Canny nodig.
+    Zoekt de onderste horizontale rand die breed genoeg is.
+    Geeft (y_bodem, canny_masker) terug; y_bodem=None als niets gevonden.
     """
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    blurred = cv2.GaussianBlur(roi_grijs, (BLUR_KERNEL, BLUR_KERNEL), 0)
+    randen  = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
 
-    # --- Schuim: wit/lichtgrijs ---
-    schuim_mask = cv2.inRange(
+    min_px     = int(roi_breedte * MIN_RAND_FRAC)
+    kandidaten = [y for y in range(roi_hoogte)
+                  if int(np.sum(randen[y] > 0)) >= min_px]
+
+    if not kandidaten:
+        return None, randen
+
+    # Groepeer aaneengesloten rijen (max 12 px gap)
+    groepen  = []
+    huidige  = [kandidaten[0]]
+    for y in kandidaten[1:]:
+        if y - huidige[-1] <= 12:
+            huidige.append(y)
+        else:
+            groepen.append(huidige)
+            huidige = [y]
+    groepen.append(huidige)
+
+    bodem = int(np.mean(groepen[-1]))
+    return bodem, randen
+
+
+# ==========================================
+# Stap 2: Schuim via wit-masker
+# ==========================================
+def _vind_schuim_grenzen(roi_bgr, y_top, y_bot):
+    """
+    Detecteert schuim op witte kleur in [y_top, y_bot].
+    Geeft (schuim_top, bier_grens) terug.
+    Als er geen schuim is: (y_top, y_top).
+    """
+    if y_bot <= y_top + MIN_ZONE_RIJEN:
+        return y_top, y_top
+
+    strook = roi_bgr[y_top:y_bot, :]
+    hsv    = cv2.cvtColor(strook, cv2.COLOR_BGR2HSV)
+
+    wit_mask = cv2.inRange(
         hsv,
-        np.array([0,           0,           SCHUIM_V_MIN]),
-        np.array([180,         SCHUIM_S_MAX, 255])
+        np.array([0,   0,            SCHUIM_V_MIN]),
+        np.array([180, SCHUIM_S_MAX, 255])
     )
+    wit_mask = cv2.morphologyEx(wit_mask, cv2.MORPH_OPEN,  MORPH_K3)
+    wit_mask = cv2.morphologyEx(wit_mask, cv2.MORPH_CLOSE, MORPH_K5)
 
-    # --- Bier: geel/amber/bruin ---
-    bier_mask = cv2.inRange(
-        hsv,
-        np.array([BIER_H_MIN, BIER_S_MIN, BIER_V_MIN]),
-        np.array([BIER_H_MAX, 255,        255])
-    )
+    breedte      = strook.shape[1]
+    min_px       = int(breedte * SCHUIM_MIN_FRAC)
+    wit_per_rij  = np.sum(wit_mask > 0, axis=1)
+    schuim_rijen = wit_per_rij >= min_px
 
-    # --- Achtergrond: donker, wat overblijft ---
-    achter_mask = cv2.inRange(
-        hsv,
-        np.array([0,   0,   0]),
-        np.array([180, 255, ACHTER_V_MAX])
-    )
-    # Trek schuim en bier eraf (prioriteit: schuim > bier > achtergrond)
-    achter_mask = cv2.bitwise_and(
-        achter_mask,
-        cv2.bitwise_not(cv2.bitwise_or(schuim_mask, bier_mask))
-    )
-
-    # Ruis verwijderen
-    schuim_mask = cv2.morphologyEx(schuim_mask, cv2.MORPH_OPEN,  MORPH_KERNEL)
-    schuim_mask = cv2.morphologyEx(schuim_mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
-    bier_mask   = cv2.morphologyEx(bier_mask,   cv2.MORPH_OPEN,  MORPH_KERNEL)
-    bier_mask   = cv2.morphologyEx(bier_mask,   cv2.MORPH_CLOSE, MORPH_KERNEL)
-
-    return schuim_mask, bier_mask, achter_mask
-
-
-def _vind_zone_grenzen(schuim_mask, bier_mask, roi_h):
-    """
-    Bepaal de verticale grenzen van elke zone.
-    Verwacht: schuim bovenaan, bier in het midden, achtergrond onderaan.
-
-    Geeft terug:
-      schuim_top   – bovenste rij met schuim
-      bier_grens   – onderste rij met schuim  (= bovenkant bier)
-      vloeistof_bot – onderste rij met bier   (= bovenkant achtergrond)
-    """
-    # Per rij: hoeveel schuim- / bierpixels?
-    schuim_per_rij = np.sum(schuim_mask > 0, axis=1)
-    bier_per_rij   = np.sum(bier_mask   > 0, axis=1)
-    breedte        = schuim_mask.shape[1]
-
-    MIN_FRAC = 0.15   # minimaal 15 % van de breedte
-
-    schuim_rijen = schuim_per_rij > int(breedte * MIN_FRAC)
-    bier_rijen   = bier_per_rij   > int(breedte * MIN_FRAC)
-
-    # Schuim top
+    # Bovenste schuimrij
     schuim_top = None
-    for y in range(roi_h):
-        if schuim_rijen[y]:
-            schuim_top = y
+    for i in range(len(schuim_rijen)):
+        if schuim_rijen[i]:
+            schuim_top = y_top + i
             break
 
-    # Bier grens = onderste schuimrij
-    bier_grens = None
-    for y in range(roi_h - 1, -1, -1):
-        if schuim_rijen[y]:
-            bier_grens = y
+    if schuim_top is None:
+        return y_top, y_top  # geen schuim
+
+    # Onderste schuimrij = scheiding schuim/bier
+    bier_grens = schuim_top
+    for i in range(len(schuim_rijen) - 1, -1, -1):
+        if schuim_rijen[i]:
+            bier_grens = y_top + i
             break
 
-    # Vloeistof bodem = onderste bierrij
-    vloeistof_bot = None
-    for y in range(roi_h - 1, -1, -1):
-        if bier_rijen[y]:
-            vloeistof_bot = y
-            break
-
-    # Fallback: als er geen bier gevonden werd maar wel schuim
-    if bier_grens is not None and vloeistof_bot is None:
-        vloeistof_bot = bier_grens
-
-    # Fallback: geen schuim maar wel bier
-    if schuim_top is None and vloeistof_bot is not None:
-        schuim_top = 0
-        bier_grens = 0
-
-    return schuim_top, bier_grens, vloeistof_bot
+    return schuim_top, bier_grens
 
 
 # ==========================================
@@ -194,31 +177,36 @@ def _analyseer_frame(frame):
     global _vorige_schuim_h, _vorige_bier_h, _stabiel_teller
 
     x, y, w, h = ROI
-    roi = frame[y:y+h, x:x+w]
-    roi_vis = roi.copy()
+    roi       = frame[y:y+h, x:x+w]
+    roi_grijs = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    roi_vis   = roi.copy()
 
-    schuim_mask, bier_mask, achter_mask = _segmenteer_zones(roi)
-    schuim_top, bier_grens, vloeistof_bot = _vind_zone_grenzen(schuim_mask, bier_mask, h)
+    # --- Stap 1: glasbodem ---
+    glasbodem, canny_masker = _vind_glasbodem(roi_grijs, w, h)
 
-    if schuim_top is None or vloeistof_bot is None:
-        # Niets gevonden
+    if glasbodem is None:
         with _lock:
             _data['geldig'] = False
         return 0.0, False, None, None, None, 0, 0, False, False, roi_vis
 
-    schuim_h = max(0, bier_grens - schuim_top)   if bier_grens  is not None else 0
-    bier_h   = max(0, vloeistof_bot - bier_grens) if bier_grens  is not None else 0
+    y_analyse_top = 5
+    y_analyse_bot = glasbodem
 
-    totaal = schuim_h + bier_h
-    foam_ratio = (schuim_h / totaal) if totaal > MIN_ZONE_RIJEN else 0.0
+    # --- Stap 2: schuim ---
+    schuim_top, bier_grens = _vind_schuim_grenzen(roi, y_analyse_top, y_analyse_bot)
+
+    # --- Hoogtes ---
+    schuim_h   = max(0, bier_grens - schuim_top)
+    bier_h     = max(0, glasbodem  - bier_grens)
+    totaal     = schuim_h + bier_h
+    foam_ratio = (schuim_h / totaal) if totaal >= MIN_ZONE_RIJEN else 0.0
     foam_ratio = max(0.0, min(1.0, foam_ratio))
 
     overflow = schuim_top < int(h * OVERFLOW_DREMPEL)
 
-    # --- Change detection ---
-    delta_schuim = abs(schuim_h - _vorige_schuim_h)
-    delta_bier   = abs(bier_h   - _vorige_bier_h)
-
+    # --- Change-detection ---
+    delta_schuim     = abs(schuim_h - _vorige_schuim_h)
+    delta_bier       = abs(bier_h   - _vorige_bier_h)
     schuim_veranderd = delta_schuim >= CHANGE_DREMPEL_PX
     bier_veranderd   = delta_bier   >= CHANGE_DREMPEL_PX
 
@@ -233,22 +221,22 @@ def _analyseer_frame(frame):
     _vorige_bier_h   = bier_h
 
     # ---- Visualisatie ----
-    # Kleur-overlay zones (halftransparant)
-    overlay = roi_vis.copy()
-    if bier_grens is not None:
-        # Schuim zone: blauwwit
-        overlay[schuim_top:bier_grens, :][schuim_mask[schuim_top:bier_grens] > 0] = (220, 220, 255)
-        # Bier zone: amber
-        overlay[bier_grens:vloeistof_bot, :][bier_mask[bier_grens:vloeistof_bot] > 0] = (0, 160, 220)
-    cv2.addWeighted(overlay, 0.3, roi_vis, 0.7, 0, roi_vis)
+    # Schuim-overlay (lichtblauw tint)
+    if schuim_h > 0 and bier_grens > schuim_top:
+        s = roi_vis[schuim_top:bier_grens, :]
+        roi_vis[schuim_top:bier_grens, :] = cv2.addWeighted(
+            s, 0.6, np.full_like(s, (220, 220, 255)), 0.4, 0)
 
-    # Grenslijn schuim top (wit)
+    # Bier-overlay (amber)
+    if bier_h > 0 and glasbodem > bier_grens:
+        b = roi_vis[bier_grens:glasbodem, :]
+        roi_vis[bier_grens:glasbodem, :] = cv2.addWeighted(
+            b, 0.65, np.full_like(b, (0, 140, 255)), 0.35, 0)
+
+    # Grenslijnen
     cv2.line(roi_vis, (0, schuim_top), (w, schuim_top), (255, 255, 255), 2)
-    # Grenslijn schuim/bier (oranje)
-    if bier_grens is not None:
-        cv2.line(roi_vis, (0, bier_grens), (w, bier_grens), (0, 160, 255), 2)
-    # Vloeistof bodem (groen)
-    cv2.line(roi_vis, (0, vloeistof_bot), (w, vloeistof_bot), (0, 255, 80), 2)
+    cv2.line(roi_vis, (0, bier_grens), (w, bier_grens), (0, 160, 255),   2)
+    cv2.line(roi_vis, (0, glasbodem),  (w, glasbodem),  (0, 255, 80),    2)
 
     cv2.putText(roi_vis,
         f"schuim {round(foam_ratio*100)}%  {'STABIEL' if stabiel else 'verandering'}",
@@ -257,7 +245,7 @@ def _analyseer_frame(frame):
 
     cv2.putText(roi_vis,
         f"S:{schuim_h}px  B:{bier_h}px",
-        (5, vloeistof_bot + 16 if vloeistof_bot + 20 < h else vloeistof_bot - 5),
+        (5, min(glasbodem + 16, h - 4)),
         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 255, 180), 1, cv2.LINE_AA)
 
     if overflow:
@@ -266,31 +254,22 @@ def _analyseer_frame(frame):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
     if DEBUG_MODE:
-        # Toon de drie maskers naast elkaar
-        def gekleurde_mask(mask, bgr):
-            out = np.zeros((*mask.shape, 3), dtype=np.uint8)
-            out[mask > 0] = bgr
-            return out
-
-        debug = np.hstack([
-            roi_vis,
-            gekleurde_mask(schuim_mask, (220, 220, 255)),
-            gekleurde_mask(bier_mask,   (0, 160, 220)),
-            gekleurde_mask(achter_mask, (60, 60, 60)),
-        ])
-        cv2.imshow("Camera DEBUG", debug)
+        canny_bgr = cv2.cvtColor(canny_masker, cv2.COLOR_GRAY2BGR)
+        target_h  = roi_vis.shape[0]
+        def pad(img):
+            dh = target_h - img.shape[0]
+            if dh > 0:
+                return np.vstack([img,
+                    np.zeros((dh, img.shape[1], 3), dtype=np.uint8)])
+            return img[:target_h]
+        cv2.imshow("Camera DEBUG", np.hstack([roi_vis, pad(canny_bgr)]))
         cv2.waitKey(1)
 
     return (
-        foam_ratio,
-        overflow,
-        schuim_top,
-        bier_grens,
-        vloeistof_bot,
-        schuim_h,
-        bier_h,
-        schuim_veranderd,
-        bier_veranderd,
+        foam_ratio, overflow,
+        schuim_top, bier_grens, glasbodem,
+        schuim_h, bier_h,
+        schuim_veranderd, bier_veranderd,
         roi_vis,
     )
 
@@ -337,17 +316,17 @@ def _camera_worker():
             continue
 
         with _lock:
-            _data['foam_ratio']        = foam_ratio
-            _data['overflow_risk']     = overflow
-            _data['schuim_top_px']     = st
-            _data['bier_grens_px']     = bg
-            _data['vloeistof_bot_px']  = vb
-            _data['schuim_hoogte_px']  = schuim_h
-            _data['bier_hoogte_px']    = bier_h
-            _data['schuim_veranderd']  = schuim_ver
-            _data['bier_veranderd']    = bier_ver
-            _data['roi_frame']         = roi_vis
-            _data['geldig']            = st is not None
+            _data['foam_ratio']       = foam_ratio
+            _data['overflow_risk']    = overflow
+            _data['schuim_top_px']    = st
+            _data['bier_grens_px']    = bg
+            _data['vloeistof_bot_px'] = vb
+            _data['schuim_hoogte_px'] = schuim_h
+            _data['bier_hoogte_px']   = bier_h
+            _data['schuim_veranderd'] = schuim_ver
+            _data['bier_veranderd']   = bier_ver
+            _data['roi_frame']        = roi_vis
+            _data['geldig']           = st is not None
 
         time.sleep(0.05)
 
@@ -386,34 +365,22 @@ def get_roi_frame():
 
 
 def schuim_actie():
-    """
-    Geeft de benodigde bijsturing terug op basis van foam_ratio.
-    Wordt gebruikt door main.py om het glas bij te sturen.
-    """
+    """Bijstuuradvies op basis van foam_ratio."""
     data = get_camera_data()
-
     if not data['geldig'] or data['schuim_top_px'] is None:
         return 'onbekend'
-
     if data['overflow_risk']:
         return 'overflow'
-
     fr = data['foam_ratio']
-
     if fr < IDEAAL_SCHUIM_MIN:
         return 'meer_schuim'
-
     if fr > IDEAAL_SCHUIM_MAX:
         return 'minder_schuim'
-
     return 'ok'
 
 
 def inhoud_stabiel():
-    """
-    True als zowel schuim- als bierhoogte de afgelopen
-    STABIEL_FRAMES frames niet significant veranderd zijn.
-    """
+    """True als schuim én bier de laatste frames stabiel zijn."""
     data = get_camera_data()
     return (data['geldig']
             and not data['schuim_veranderd']
