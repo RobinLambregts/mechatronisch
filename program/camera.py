@@ -47,14 +47,17 @@ BLUR_KERNEL     = 5
 MIN_RAND_FRAC   = 0.25   # min 25% breedte voor een horizontale rand
 
 # --- Glaswand (verticale Canny) ---
+# Hoeveel % van elke zijkant we afknippen als "glaswandmarge"
+# (wordt verfijnd door wand-detectie, dit is de fallback)
 WAND_MARGE_FRAC = 0.10   # 10% van iedere kant als minimum marge
 WAND_ZOEK_FRAC  = 0.30   # zoek wanden in buitenste 30% van ROI
 
 # --- Adaptieve schuimdrempel ---
-ADAPT_PERCENTIEL = 92
-ADAPT_FACTOR     = 0.82
-ADAPT_V_ABSMIN   = 140
-ADAPT_V_ABSMAX   = 230
+# V_min = percentiel_95(V-kanaal binnenste ROI) * ADAPT_FACTOR
+ADAPT_PERCENTIEL = 92     # percentiel van helderheid als referentie
+ADAPT_FACTOR     = 0.82   # schuim moet minstens 82% van de piek zijn
+ADAPT_V_ABSMIN   = 140    # absolute ondergrens (veiligheidsnets)
+ADAPT_V_ABSMAX   = 230    # absolute bovengrens (voorkom dat alles schuim is)
 
 # Max saturatie voor schuim (wit = lage saturatie)
 SCHUIM_S_MAX = 75
@@ -138,22 +141,32 @@ def _vind_glasbodem(roi_grijs, roi_breedte, roi_hoogte):
 
 # ==========================================
 # Stap 1b: Glaswanden (verticale Canny)
+# Geeft (x_links, x_rechts) terug — de binnenste grenzen van het glas.
 # ==========================================
 def _vind_glaswanden(roi_grijs, roi_breedte, roi_hoogte, glasbodem):
+    """
+    Zoekt de glaswanden door verticale Canny-randen te tellen
+    in de bovenste helft van de vloeistofkolom.
+    Geeft (x_links_binnen, x_rechts_binnen) terug.
+    """
+    # Analyseer alleen de middelste verticale sectie (vermijd bodem/rand)
     y_top = max(0, 20)
     y_bot = glasbodem if glasbodem else roi_hoogte
     y_bot = max(y_top + 20, y_bot - 20)
 
-    strook  = roi_grijs[y_top:y_bot, :]
+    strook = roi_grijs[y_top:y_bot, :]
     blurred = cv2.GaussianBlur(strook, (BLUR_KERNEL, BLUR_KERNEL), 0)
     randen  = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
 
+    # Tel rand-pixels per kolom
     rand_per_kolom = np.sum(randen > 0, axis=0)
 
-    marge    = int(roi_breedte * WAND_MARGE_FRAC)
+    # Fallback: vaste marge
+    marge = int(roi_breedte * WAND_MARGE_FRAC)
     x_links  = marge
     x_rechts = roi_breedte - marge
 
+    # Zoek in buitenste 30% links de kolom met de meeste randen
     zoek_breedte = int(roi_breedte * WAND_ZOEK_FRAC)
 
     links_kolommen  = rand_per_kolom[:zoek_breedte]
@@ -161,6 +174,7 @@ def _vind_glaswanden(roi_grijs, roi_breedte, roi_hoogte, glasbodem):
 
     if links_kolommen.max() > 2:
         beste_links = int(np.argmax(links_kolommen))
+        # Neem een marge aan de binnenkant van de wand
         x_links = min(beste_links + int(roi_breedte * 0.06),
                       int(roi_breedte * 0.35))
 
@@ -170,6 +184,7 @@ def _vind_glaswanden(roi_grijs, roi_breedte, roi_hoogte, glasbodem):
         x_rechts = max(x_rechts_abs - int(roi_breedte * 0.06),
                        int(roi_breedte * 0.65))
 
+    # Zorg dat er voldoende binnenbreedte is
     if x_rechts - x_links < int(roi_breedte * 0.30):
         x_links  = marge
         x_rechts = roi_breedte - marge
@@ -181,6 +196,10 @@ def _vind_glaswanden(roi_grijs, roi_breedte, roi_hoogte, glasbodem):
 # Stap 2: Adaptieve V-drempel
 # ==========================================
 def _bereken_v_drempel(roi_bgr, x_links, x_rechts, y_top, y_bot):
+    """
+    Berekent de helderheidsdrempel voor schuim adaptief
+    op basis van het helderheidsprofiel van de binnenste ROI.
+    """
     if y_bot <= y_top + 5 or x_rechts <= x_links + 5:
         return ADAPT_V_ABSMIN
 
@@ -188,8 +207,9 @@ def _bereken_v_drempel(roi_bgr, x_links, x_rechts, y_top, y_bot):
     hsv       = cv2.cvtColor(binnenste, cv2.COLOR_BGR2HSV)
     v_kanaal  = hsv[:, :, 2].flatten()
 
-    piek    = float(np.percentile(v_kanaal, ADAPT_PERCENTIEL))
+    piek = float(np.percentile(v_kanaal, ADAPT_PERCENTIEL))
     drempel = piek * ADAPT_FACTOR
+
     drempel = max(ADAPT_V_ABSMIN, min(ADAPT_V_ABSMAX, drempel))
     return int(drempel)
 
@@ -198,12 +218,19 @@ def _bereken_v_drempel(roi_bgr, x_links, x_rechts, y_top, y_bot):
 # Stap 3: Schuim via wit-masker + continuïteitseis
 # ==========================================
 def _vind_schuim_grenzen(roi_bgr, x_links, x_rechts, y_top, y_bot, v_min):
+    """
+    Detecteert schuim in de binnenste strook [x_links:x_rechts, y_top:y_bot].
+    Gebruikt adaptieve V-drempel en continuïteitseis.
+    Geeft (schuim_top, bier_grens) terug; (y_top, y_top) als geen schuim.
+    """
     if y_bot <= y_top + MIN_ZONE_RIJEN:
         return y_top, y_top
 
-    strook = roi_bgr[y_top:y_bot, x_links:x_rechts]
-    hsv    = cv2.cvtColor(strook, cv2.COLOR_BGR2HSV)
+    # Analyseer alleen binnen de glaswanden
+    strook  = roi_bgr[y_top:y_bot, x_links:x_rechts]
+    hsv     = cv2.cvtColor(strook, cv2.COLOR_BGR2HSV)
 
+    # Wit: lage saturatie + helderheid boven adaptieve drempel
     wit_mask = cv2.inRange(
         hsv,
         np.array([0,   0,           v_min]),
@@ -215,13 +242,15 @@ def _vind_schuim_grenzen(roi_bgr, x_links, x_rechts, y_top, y_bot, v_min):
     binnenbreedte = x_rechts - x_links
     min_px        = int(binnenbreedte * SCHUIM_MIN_FRAC)
     wit_per_rij   = np.sum(wit_mask > 0, axis=1)
-    schuim_rijen  = wit_per_rij >= min_px
+    schuim_rijen  = wit_per_rij >= min_px  # bool array, lengte = y_bot - y_top
 
+    # --- Continuïteitseis: zoek het grootste aaneengesloten blok ---
     beste_start = None
     beste_einde = None
     beste_len   = 0
-    in_blok     = False
-    blok_start  = 0
+
+    in_blok  = False
+    blok_start = 0
 
     for i, is_schuim in enumerate(schuim_rijen):
         if is_schuim and not in_blok:
@@ -235,6 +264,7 @@ def _vind_schuim_grenzen(roi_bgr, x_links, x_rechts, y_top, y_bot, v_min):
                 beste_start = blok_start
                 beste_einde = i - 1
 
+    # Sluit open blok aan het einde af
     if in_blok:
         blok_len = len(schuim_rijen) - blok_start
         if blok_len > beste_len:
@@ -243,7 +273,7 @@ def _vind_schuim_grenzen(roi_bgr, x_links, x_rechts, y_top, y_bot, v_min):
             beste_einde = len(schuim_rijen) - 1
 
     if beste_start is None or beste_len < MIN_SCHUIM_BLOK:
-        return y_top, y_top
+        return y_top, y_top  # geen geldig schuimblok
 
     schuim_top = y_top + beste_start
     bier_grens = y_top + beste_einde
@@ -262,7 +292,7 @@ def _analyseer_frame(frame):
     roi_grijs = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     roi_vis   = roi.copy()
 
-    # Stap 1a: glasbodem — als deze ontbreekt is er geen geldig beeld
+    # Stap 1a: glasbodem
     glasbodem, canny_masker = _vind_glasbodem(roi_grijs, w, h)
     if glasbodem is None:
         with _lock:
@@ -302,24 +332,30 @@ def _analyseer_frame(frame):
     else:
         _stabiel_teller += 1
 
+    stabiel = _stabiel_teller >= STABIEL_FRAMES
+
     _vorige_schuim_h = schuim_h
     _vorige_bier_h   = bier_h
 
     # ---- Visualisatie ----
+    # Glaswandlijnen (grijs, gestippeld effect via segmenten)
     for yy in range(y_analyse_top, y_analyse_bot, 8):
-        cv2.line(roi_vis, (x_links, yy),  (x_links,  min(yy+4, y_analyse_bot)), (80, 80, 80), 1)
+        cv2.line(roi_vis, (x_links, yy),  (x_links, min(yy+4, y_analyse_bot)),  (80, 80, 80), 1)
         cv2.line(roi_vis, (x_rechts, yy), (x_rechts, min(yy+4, y_analyse_bot)), (80, 80, 80), 1)
 
+    # Schuim-overlay (lichtblauw)
     if schuim_h > 0 and bier_grens > schuim_top:
         s = roi_vis[schuim_top:bier_grens, x_links:x_rechts]
         roi_vis[schuim_top:bier_grens, x_links:x_rechts] = cv2.addWeighted(
             s, 0.55, np.full_like(s, (220, 220, 255)), 0.45, 0)
 
+    # Bier-overlay (amber)
     if bier_h > 0 and glasbodem > bier_grens:
         b = roi_vis[bier_grens:glasbodem, x_links:x_rechts]
         roi_vis[bier_grens:glasbodem, x_links:x_rechts] = cv2.addWeighted(
             b, 0.65, np.full_like(b, (0, 140, 255)), 0.35, 0)
 
+    # Grenslijnen (vol beeld breed)
     cv2.line(roi_vis, (x_links, schuim_top), (x_rechts, schuim_top), (255, 255, 255), 2)
     cv2.line(roi_vis, (x_links, bier_grens), (x_rechts, bier_grens), (0, 160, 255),   2)
     cv2.line(roi_vis, (0,       glasbodem),  (w,        glasbodem),  (0, 255, 80),    2)
@@ -330,7 +366,7 @@ def _analyseer_frame(frame):
         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.putText(roi_vis,
-        f"S:{schuim_h}px  B:{bier_h}px  {'STABIEL' if (_stabiel_teller >= STABIEL_FRAMES) else 'BEWEEGT'}",
+        f"S:{schuim_h}px  B:{bier_h}px  {'STABIEL' if stabiel else 'BEWEEGT'}",
         (5, min(glasbodem + 14, h - 4)),
         cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 255, 180), 1, cv2.LINE_AA)
 
@@ -341,6 +377,7 @@ def _analyseer_frame(frame):
 
     if DEBUG_MODE:
         canny_bgr = cv2.cvtColor(canny_masker, cv2.COLOR_GRAY2BGR)
+        # Teken wand-kolommen in groen
         cv2.line(canny_bgr, (x_links, 0),  (x_links, h),  (0, 255, 0), 1)
         cv2.line(canny_bgr, (x_rechts, 0), (x_rechts, h), (0, 255, 0), 1)
         target_h = roi_vis.shape[0]
@@ -352,7 +389,6 @@ def _analyseer_frame(frame):
         cv2.imshow("Camera DEBUG", np.hstack([roi_vis, pad(canny_bgr)]))
         cv2.waitKey(1)
 
-    # glasbodem (vb) is het bewijs dat er een geldig beeld is
     return (
         foam_ratio, overflow,
         schuim_top, bier_grens, glasbodem,
@@ -414,9 +450,7 @@ def _camera_worker():
             _data['schuim_veranderd'] = schuim_ver
             _data['bier_veranderd']   = bier_ver
             _data['roi_frame']        = roi_vis
-            # FIX: geldig = glasbodem gevonden (vb), niet schuim_top (st)
-            # st is nooit None — het valt terug op y_top als er geen schuim is
-            _data['geldig']           = vb is not None
+            _data['geldig']           = st is not None
 
         time.sleep(0.05)
 
@@ -457,8 +491,7 @@ def get_roi_frame():
 def schuim_actie():
     """Bijstuuradvies op basis van foam_ratio."""
     data = get_camera_data()
-    # FIX: schuim_top_px is nooit None — check alleen geldig
-    if not data['geldig']:
+    if not data['geldig'] or data['schuim_top_px'] is None:
         return 'onbekend'
     if data['overflow_risk']:
         return 'overflow'
