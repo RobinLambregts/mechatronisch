@@ -202,7 +202,12 @@ def _analyseer_frame(frame):
     foam_ratio = (schuim_h / totaal) if totaal >= MIN_ZONE_RIJEN else 0.0
     foam_ratio = max(0.0, min(1.0, foam_ratio))
 
-    overflow = schuim_top < int(h * OVERFLOW_DREMPEL)
+    heeft_schuim = schuim_h >= MIN_ZONE_RIJEN
+
+    overflow = (
+        heeft_schuim and
+        schuim_top < int(h * OVERFLOW_DREMPEL)
+    )
 
     # --- Change-detection ---
     delta_schuim     = abs(schuim_h - _vorige_schuim_h)
