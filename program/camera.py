@@ -29,15 +29,16 @@ ADAPT_V_ABSMIN   = 130
 SCHUIM_S_MAX     = 85
 SCHUIM_MIN_FRAC  = 0.20
 MIN_SCHUIM_BLOK  = 6
+SCHUIM_MAX_GAT   = 3    # max pixels gat binnen één schuimblok
 
 # --- Leeg glas detectie ---
-MIN_VULHOOGTE_FRAC = 0.15   # minder dan 15% gevuld → leeg glas
-MIN_BIER_FRAC      = 0.05   # minimale amberkleur-fractie in bierzone
-MIN_BIER_H_PX      = 2      # minimale bierhoogte voor ambercheck
-LEEG_RATIO_DREMPEL = 0.85   # als ratio > dit én bier < 15px → leeg
+MIN_VULHOOGTE_FRAC = 0.15
+MIN_BIER_FRAC      = 0.05
+MIN_BIER_H_PX      = 2
+LEEG_RATIO_DREMPEL = 0.75
 
 # --- Stabiliteit ---
-STABIEL_DREMPEL = 8         # pixels verschil om als "verandering" te tellen
+STABIEL_DREMPEL = 8
 
 # --- Normen ---
 IDEAAL_SCHUIM_MIN = 0.15
@@ -81,7 +82,9 @@ def _vind_glasbodem(roi_grijs, w, h):
     blurred    = cv2.GaussianBlur(roi_grijs, (5, 5), 0)
     randen     = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
     min_px     = int(w * MIN_RAND_FRAC)
-    kandidaten = [y for y in range(h) if int(np.sum(randen[y] > 0)) >= min_px]
+    # Begrens tot max 90% van ROI-hoogte zodat tafelrand niet meegeteld wordt
+    max_bodem  = int(h * 0.90)
+    kandidaten = [y for y in range(max_bodem) if int(np.sum(randen[y] > 0)) >= min_px]
     if not kandidaten:
         return None
     return int(np.mean(kandidaten[-10:]))
@@ -128,10 +131,10 @@ def _analyseer_frame(frame):
     x_l   = _vastgelegde_links  if _vastgelegde_links  else int(w * 0.1)
     x_r   = _vastgelegde_rechts if _vastgelegde_rechts else int(w * 0.9)
 
-    # --- STAP 2: Schuim detectie ---
-    # Standaardwaarden — overschreven als binnenkant geldig is
-    schuim_top = 20
-    bier_grens = 20
+    # --- STAP 2: Schuim detectie (van onder naar boven) ---
+    # Standaard: geen vloeistof gevonden
+    schuim_top = bodem
+    bier_grens = bodem
 
     binnenkant = roi[20:bodem, x_l:x_r]
     if binnenkant.size > 0:
@@ -146,27 +149,40 @@ def _analyseer_frame(frame):
         min_px_rij  = int((x_r - x_l) * SCHUIM_MIN_FRAC)
 
         schuim_rijen = np.where(wit_per_rij > min_px_rij)[0]
+
         if len(schuim_rijen) > MIN_SCHUIM_BLOK:
-            schuim_top = int(schuim_rijen[0])  + 20
-            bier_grens = int(schuim_rijen[-1]) + 20
+            # Zoek het ONDERSTE aaneengesloten blok witte rijen.
+            # Alles erboven (glaswand, lichtreflectie) wordt genegeerd
+            # omdat er een gat zit tussen glaswand-wit en schuim-wit.
+            onderste_einde = int(schuim_rijen[-1])
+
+            blok_start = onderste_einde
+            for i in range(len(schuim_rijen) - 2, -1, -1):
+                if schuim_rijen[i + 1] - schuim_rijen[i] <= SCHUIM_MAX_GAT:
+                    blok_start = int(schuim_rijen[i])
+                else:
+                    break  # gat gevonden → alles erboven is glaswand, stop
+
+            schuim_top = blok_start + 20
+            bier_grens = onderste_einde + 20
 
     # --- STAP 3: Hoogtes berekenen ---
     schuim_h    = max(0, bier_grens - schuim_top)
     bier_h      = max(0, bodem - bier_grens)
     totaal      = schuim_h + bier_h
-    glas_hoogte = max(1, bodem - 20)   # voorkom deling door nul
+    glas_hoogte = max(1, bodem - 20)
 
-    # Voorlopige ratio — altijd beschikbaar voor de leegheidchecks
+    # Voorlopige ratio — altijd beschikbaar voor leegheidchecks
     ratio_voorlopig = (schuim_h / totaal) if totaal > 10 else 0.0
 
     # --- STAP 4: Leeg glas detectie ---
     is_leeg = False
 
-    # Check 1: te weinig totale vloeistof (relatief)
+    # Check 1: te weinig totale vloeistof
     if totaal < (glas_hoogte * MIN_VULHOOGTE_FRAC):
         is_leeg = True
 
-    # Check 2: bijna geen bier én hoge schuimratio → leeg glas / vals alarm
+    # Check 2: bijna geen bier én hoge schuimratio
     if not is_leeg and bier_h < 15 and ratio_voorlopig > LEEG_RATIO_DREMPEL:
         is_leeg = True
 
