@@ -186,16 +186,19 @@ def _analyseer_frame(frame):
     if not is_leeg and bier_h < 15 and ratio_voorlopig > LEEG_RATIO_DREMPEL:
         is_leeg = True
 
-    # Check 3: geen amberkleur in bierzone
+    # Check 3: is er überhaupt donkere vloeistof in de bierzone?
+    # (niet alleen amber — ook donker/blauw bier telt mee)
     if not is_leeg and bier_h >= MIN_BIER_H_PX and binnenkant.size > 0:
         bier_zone = roi[bier_grens:bodem, x_l:x_r]
         if bier_zone.size > 0 and bier_zone.shape[0] > 0 and bier_zone.shape[1] > 0:
-            hsv_bier   = cv2.cvtColor(bier_zone, cv2.COLOR_BGR2HSV)
-            amber_mask = cv2.inRange(hsv_bier,
-                                     np.array([10,  60,  80]),
-                                     np.array([35, 255, 255]))
-            amber_frac = np.sum(amber_mask > 0) / amber_mask.size
-            if amber_frac < MIN_BIER_FRAC and ratio_voorlopig > LEEG_RATIO_DREMPEL:
+            hsv_bier = cv2.cvtColor(bier_zone, cv2.COLOR_BGR2HSV)
+            # Wit/leeg glas heeft hoge V én lage S — vloeistof heeft hogere S of lagere V
+            wit_in_bier = cv2.inRange(hsv_bier,
+                                       np.array([0,   0, 180]),
+                                       np.array([180, 40, 255]))
+            wit_frac = np.sum(wit_in_bier > 0) / wit_in_bier.size
+            # Als bierzone >85% wit/transparant is → geen echte vloeistof
+            if wit_frac > 0.85 and ratio_voorlopig > LEEG_RATIO_DREMPEL:
                 is_leeg = True
 
     # Definitieve ratio
