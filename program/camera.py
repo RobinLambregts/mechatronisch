@@ -34,6 +34,7 @@ MIN_SCHUIM_BLOK  = 6
 MIN_VULHOOGTE_FRAC = 0.15   # minder dan 15% gevuld → leeg glas
 MIN_BIER_FRAC      = 0.05   # minimale amberkleur-fractie in bierzone
 MIN_BIER_H_PX      = 2      # minimale bierhoogte voor ambercheck
+LEEG_RATIO_DREMPEL = 0.85   # als ratio > dit én bier < 15px → leeg
 
 # --- Stabiliteit ---
 STABIEL_DREMPEL = 8         # pixels verschil om als "verandering" te tellen
@@ -77,9 +78,9 @@ _picam2 = None
 # ==========================================
 
 def _vind_glasbodem(roi_grijs, w, h):
-    blurred   = cv2.GaussianBlur(roi_grijs, (5, 5), 0)
-    randen    = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
-    min_px    = int(w * MIN_RAND_FRAC)
+    blurred    = cv2.GaussianBlur(roi_grijs, (5, 5), 0)
+    randen     = cv2.Canny(blurred, CANNY_LAAG, CANNY_HOOG)
+    min_px     = int(w * MIN_RAND_FRAC)
     kandidaten = [y for y in range(h) if int(np.sum(randen[y] > 0)) >= min_px]
     if not kandidaten:
         return None
@@ -118,7 +119,7 @@ def _analyseer_frame(frame):
     if _vastgelegde_bodem is None:
         gevonden_bodem = _vind_glasbodem(roi_grijs, w, h)
         if gevonden_bodem:
-            _vastgelegde_bodem  = gevonden_bodem
+            _vastgelegde_bodem = gevonden_bodem
             _vastgelegde_links, _vastgelegde_rechts = _vind_glaswanden(
                 roi_grijs, w, h, _vastgelegde_bodem)
             print(f"DEBUG: Bodem vastgezet op Y={_vastgelegde_bodem}")
@@ -128,6 +129,10 @@ def _analyseer_frame(frame):
     x_r   = _vastgelegde_rechts if _vastgelegde_rechts else int(w * 0.9)
 
     # --- STAP 2: Schuim detectie ---
+    # Standaardwaarden — overschreven als binnenkant geldig is
+    schuim_top = 20
+    bier_grens = 20
+
     binnenkant = roi[20:bodem, x_l:x_r]
     if binnenkant.size > 0:
         hsv   = cv2.cvtColor(binnenkant, cv2.COLOR_BGR2HSV)
@@ -135,7 +140,7 @@ def _analyseer_frame(frame):
         v_min = max(ADAPT_V_ABSMIN, v_min)
 
         wit_mask    = cv2.inRange(hsv,
-                                  np.array([0,   0,     v_min]),
+                                  np.array([0,   0,            v_min]),
                                   np.array([180, SCHUIM_S_MAX, 255]))
         wit_per_rij = np.sum(wit_mask > 0, axis=1)
         min_px_rij  = int((x_r - x_l) * SCHUIM_MIN_FRAC)
@@ -144,34 +149,29 @@ def _analyseer_frame(frame):
         if len(schuim_rijen) > MIN_SCHUIM_BLOK:
             schuim_top = int(schuim_rijen[0])  + 20
             bier_grens = int(schuim_rijen[-1]) + 20
-        else:
-            schuim_top = bier_grens = 20
-    else:
-        schuim_top = bier_grens = 20
 
     # --- STAP 3: Hoogtes berekenen ---
-    schuim_h = max(0, bier_grens - schuim_top)
-    bier_h   = max(0, bodem - bier_grens)
-    totaal   = schuim_h + bier_h
-    glas_hoogte = bodem - 20
+    schuim_h    = max(0, bier_grens - schuim_top)
+    bier_h      = max(0, bodem - bier_grens)
+    totaal      = schuim_h + bier_h
+    glas_hoogte = max(1, bodem - 20)   # voorkom deling door nul
 
-    # --- STAP 4: Leeg glas detectie ---
-
-    # Check 1a: te weinig totale vloeistof (relatief)
-    is_leeg = totaal < (glas_hoogte * MIN_VULHOOGTE_FRAC)
-
-    # Check 1b: bier bijna nul pixels (absoluut) — vangt verkeerde bodemdetectie op
-    if not is_leeg and bier_h < 15:
-        # Bijna geen bierzone → waarschijnlijk leeg glas of vals alarm
-        # Controleer of schuim ook echt wit is (echte schuimpixels)
-        if ratio_voorlopig > 0.85:
-            is_leeg = True
-
-    # Check 2: geen amberkleur in bierzone terwijl ratio hoog is
-    # (ratio wordt hier voorlopig berekend voor de check)
+    # Voorlopige ratio — altijd beschikbaar voor de leegheidchecks
     ratio_voorlopig = (schuim_h / totaal) if totaal > 10 else 0.0
 
-    if not is_leeg and binnenkant.size > 0 and bier_h > MIN_BIER_H_PX:
+    # --- STAP 4: Leeg glas detectie ---
+    is_leeg = False
+
+    # Check 1: te weinig totale vloeistof (relatief)
+    if totaal < (glas_hoogte * MIN_VULHOOGTE_FRAC):
+        is_leeg = True
+
+    # Check 2: bijna geen bier én hoge schuimratio → leeg glas / vals alarm
+    if not is_leeg and bier_h < 15 and ratio_voorlopig > LEEG_RATIO_DREMPEL:
+        is_leeg = True
+
+    # Check 3: geen amberkleur in bierzone
+    if not is_leeg and bier_h >= MIN_BIER_H_PX and binnenkant.size > 0:
         bier_zone = roi[bier_grens:bodem, x_l:x_r]
         if bier_zone.size > 0 and bier_zone.shape[0] > 0 and bier_zone.shape[1] > 0:
             hsv_bier   = cv2.cvtColor(bier_zone, cv2.COLOR_BGR2HSV)
@@ -179,7 +179,7 @@ def _analyseer_frame(frame):
                                      np.array([10,  60,  80]),
                                      np.array([35, 255, 255]))
             amber_frac = np.sum(amber_mask > 0) / amber_mask.size
-            if amber_frac < MIN_BIER_FRAC and ratio_voorlopig > 0.80:
+            if amber_frac < MIN_BIER_FRAC and ratio_voorlopig > LEEG_RATIO_DREMPEL:
                 is_leeg = True
 
     # Definitieve ratio
@@ -201,11 +201,11 @@ def _analyseer_frame(frame):
     cv2.line(roi_vis, (x_l, 20),    (x_l, bodem), (0, 255, 0), 1)
     cv2.line(roi_vis, (x_r, 20),    (x_r, bodem), (0, 255, 0), 1)
 
-    if schuim_h > 0:
+    if schuim_h > 0 and not is_leeg:
         overlay = np.full((schuim_h, x_r - x_l, 3), (255, 255, 255), np.uint8)
         roi_vis[schuim_top:bier_grens, x_l:x_r] = cv2.addWeighted(
             roi_vis[schuim_top:bier_grens, x_l:x_r], 0.5, overlay, 0.5, 0)
-    if bier_h > 0:
+    if bier_h > 0 and not is_leeg:
         overlay = np.full((bier_h, x_r - x_l, 3), (0, 140, 255), np.uint8)
         roi_vis[bier_grens:bodem, x_l:x_r] = cv2.addWeighted(
             roi_vis[bier_grens:bodem, x_l:x_r], 0.7, overlay, 0.3, 0)
@@ -223,16 +223,16 @@ def _analyseer_frame(frame):
     geldig = not is_leeg
 
     return (
-        ratio,            # [0] foam_ratio
-        overflow,         # [1] overflow_risk
-        schuim_top,       # [2] schuim_top_px
-        bier_grens,       # [3] bier_grens_px
-        bodem,            # [4] vloeistof_bot_px
-        schuim_h,         # [5] schuim_hoogte_px
-        bier_h,           # [6] bier_hoogte_px
-        roi_vis,          # [7] roi_frame
-        geldig,           # [8] geldig
-        schuim_veranderd, # [9] schuim_veranderd
+        ratio,            # [0]  foam_ratio
+        overflow,         # [1]  overflow_risk
+        schuim_top,       # [2]  schuim_top_px
+        bier_grens,       # [3]  bier_grens_px
+        bodem,            # [4]  vloeistof_bot_px
+        schuim_h,         # [5]  schuim_hoogte_px
+        bier_h,           # [6]  bier_hoogte_px
+        roi_vis,          # [7]  roi_frame
+        geldig,           # [8]  geldig
+        schuim_veranderd, # [9]  schuim_veranderd
         bier_veranderd,   # [10] bier_veranderd
     )
 
@@ -259,7 +259,7 @@ def inhoud_stabiel():
 
 def schuim_actie():
     d = get_camera_data()
-    if d['overflow_risk']:              return 'overflow'
+    if d['overflow_risk']:                   return 'overflow'
     if d['foam_ratio'] < IDEAAL_SCHUIM_MIN: return 'meer_schuim'
     if d['foam_ratio'] > IDEAAL_SCHUIM_MAX: return 'minder_schuim'
     return 'ok'
