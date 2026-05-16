@@ -56,6 +56,8 @@ STABIEL_BEVESTIG  = 3       # aantal stabiele checks voor "echt stabiel"
 MAX_BIJSTUUR      = 8       # max bijstuur-pogingen per kap voor het opgeeft
 ITERATIE_PAUZE    = 0.5     # seconden tussen iteraties
 
+global _stop_prog
+
 # ==========================================
 # Globale vlaggen
 # ==========================================
@@ -334,7 +336,6 @@ def _input_loop():
             camera.reset_calibratie()
 
         elif cmd == 'exit':
-            global _stop_prog
             _stop_prog = True
             break
 
