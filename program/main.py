@@ -3,23 +3,29 @@ main.py - Bier inkap robot
 ==========================
 Start: python3 main.py
 
-Workflow:
-  1. Init IMUs + motoren + camera
-  2. Automatische kalibratie (flesje 45°, glas -90°)
-  3. Wacht op "start" commando in terminal
-  4. Vul-routine:
-       a. Flesje (Motor 2) naar beginstand FLESJE_VULDOEL
-       b. Gierlus:
-            • Camera ziet GEEN verandering in schuim/bier
-              → flesje zachtjes verder kantelen (FLESJE_STAP per cyclus)
-            • Camera ziet WEL verandering
-              → flesje stilhouden, glas bijsturen op foam_ratio:
-                  - te veel schuim  → glas schuiner  (richting -90°)
-                  - te weinig schuim → glas rechter  (richting -40°)
-                  - overflow         → flesje terug, stop
-       c. Flesje leeg (bier_hoogte_px < drempel) → eindfase
-       d. Flesje terug, glas rechtop
-  5. UI venster toont live status
+Iteratieve inkap-logica:
+  Elke iteratie beslist de camera wat er moet gebeuren:
+
+  FASE 0 — Glas positioneren
+    → Glas schuin zetten op starthoek
+
+  FASE 1 — Kleine kap (flesje 10° kantelen)
+    → Flesje 10° verder, wacht tot stabiel
+
+  FASE 2 — Glas bijsturen
+    → Op basis van schuim_richting():
+        meer_schuim   → glas schuiner
+        minder_schuim → glas rechter
+        ok            → door naar volgende kap
+
+  FASE 3 — Bijna vol: glas rechtop
+    → Als gevuld_frac >= VOL_DREMPEL: glas naar rechtop
+      zodat overlopen voorkomen wordt
+
+  HERHAAL fase 1-3 tot:
+    - get_advies() == 'klaar'
+    - of flesje op maximum
+    - of overflow
 """
 
 import time
@@ -27,35 +33,28 @@ import threading
 import cv2
 import numpy as np
 
-import imus
-import motors
 import camera
-import input as inp
-from calibration import voer_kalibratie_uit
 
 # ==========================================
-# Inkap-algoritme parameters
+# Inkap parameters
 # ==========================================
-FLESJE_BEGIN     = 30.0    # beginstand flesje bij start gieten
-FLESJE_MAX       = 50.0    # maximale kantelhoek flesje
-FLESJE_START     = 0.0     # parkeerstand flesje (na afloop)
-FLESJE_STAP      = 1.5     # graden per stap als bier stabiel is
+FLESJE_START      = 0.0     # parkeerstand flesje
+FLESJE_BEGIN      = 20.0    # beginstand bij start gieten
+FLESJE_KAP_STAP   = 10.0   # graden per kap-iteratie
+FLESJE_MAX        = 55.0    # maximale kantelhoek flesje
 
-GLAS_START       = -90.0   # startpositie glas (schuin)
-GLAS_RECHTOP     = -45.0   # eindpositie glas (bijna rechtop)
-GLAS_STAP_GROOT  = 3.0     # bijstap te veel schuim
-GLAS_STAP_KLEIN  = 1.5     # bijstap te weinig schuim
+GLAS_SCHUIN       = -85.0   # starthoek glas (schuin voor schuim)
+GLAS_RECHTOP      = -45.0   # eindhoek glas (bijna rechtop)
+GLAS_STAP_GROOT   =  4.0    # bijstap bij te veel schuim
+GLAS_STAP_KLEIN   =  2.0    # bijstap bij te weinig schuim
+GLAS_MIN          = -90.0
+GLAS_MAX          = -40.0
 
-# Glas grenzen
-GLAS_MIN = -90.0
-GLAS_MAX = -40.0
-
-# Tijd tussen camera-checks tijdens gieten
-CAMERA_CHECK_INTERVAL = 0.3   # seconden
-
-# Flesje leeg: bierhoogte onder dit aantal pixels gedurende N checks
-LEEG_BIER_PX    = 10
-LEEG_TELLER_MAX = 10
+VOL_DREMPEL       = 0.80    # gevuld_frac >= dit → glas rechtop zetten
+STABIEL_WACHT     = 0.4     # seconden tussen camera-checks
+STABIEL_BEVESTIG  = 3       # aantal stabiele checks voor "echt stabiel"
+MAX_BIJSTUUR      = 8       # max bijstuur-pogingen per kap voor het opgeeft
+ITERATIE_PAUZE    = 0.5     # seconden tussen iteraties
 
 # ==========================================
 # Globale vlaggen
@@ -64,238 +63,331 @@ _vul_bezig  = False
 _stop_vlag  = threading.Event()
 _stop_prog  = False
 
+# Gesimuleerde motorposities (dummy)
+_sim_flesje_hoek = FLESJE_START
+_sim_glas_hoek   = GLAS_SCHUIN
 
 # ==========================================
-# Inkap routine
+# Dummy motor functies
+# (vervang later door echte motors.* aanroepen)
 # ==========================================
+
+def _zet_flesje(hoek: float):
+    global _sim_flesje_hoek
+    hoek = max(FLESJE_START, min(FLESJE_MAX, hoek))
+    _sim_flesje_hoek = hoek
+    print(f"    [MOTOR] Flesje → {hoek:.1f}°")
+
+
+def _zet_glas(hoek: float):
+    global _sim_glas_hoek
+    hoek = max(GLAS_MIN, min(GLAS_MAX, hoek))
+    _sim_glas_hoek = hoek
+    print(f"    [MOTOR] Glas   → {hoek:.1f}°")
+
+
+def _wacht_stabiel(label: str = "") -> bool:
+    """
+    Wacht tot camera stabiel is of stop_vlag gezet wordt.
+    Geeft False terug als gestopt.
+    """
+    teller = 0
+    while not _stop_vlag.is_set():
+        if camera.inhoud_stabiel():
+            teller += 1
+            if teller >= STABIEL_BEVESTIG:
+                return True
+        else:
+            teller = 0
+        time.sleep(STABIEL_WACHT)
+    return False
+
+
+# ==========================================
+# Inkap routine (iteratief)
+# ==========================================
+
 def vul_routine():
-    global _vul_bezig
+    global _vul_bezig, _sim_flesje_hoek, _sim_glas_hoek
     if _vul_bezig:
-        print("[Vul] Al bezig met inkappen.")
+        print("[Vul] Al bezig.")
         return
 
     _vul_bezig = True
     _stop_vlag.clear()
 
-    print("\n" + "="*55)
-    print(" INKAPPEN GESTART")
-    print("="*55)
+    print("\n" + "=" * 60)
+    print("  INKAPPEN GESTART")
+    print("=" * 60)
 
-    # Huidige glashoek als startpunt
-    huidige_glas_hoek   = imus.get_angle(imus.MPU2_ADDR) or GLAS_START
-    huidige_flesje_hoek = FLESJE_BEGIN
-    leeg_teller         = 0
+    huidige_flesje = FLESJE_BEGIN
+    huidige_glas   = GLAS_SCHUIN
+    iteratie       = 0
 
-    # ---- Stap 1: flesje naar beginstand ----
-    print(f"[1/4] Flesje naar beginstand {FLESJE_BEGIN}°…")
-    motors.stel_doel_in(2, FLESJE_BEGIN)
-    if not motors.wacht_op_doel(2, timeout=15):
-        print("  !! Flesje timeout — doorgaan…")
+    # ── FASE 0: beginstand ──────────────────────────────────────
+    print(f"\n[FASE 0] Beginstand: flesje={huidige_flesje}°  glas={huidige_glas}°")
+    _zet_flesje(huidige_flesje)
+    _zet_glas(huidige_glas)
+    time.sleep(1.0)  # even wachten tot motoren op positie zijn
 
-    if _stop_vlag.is_set():
-        _einde_vul()
-        return
-
-    # ---- Stap 2: gierlus ----
-    print("[2/4] Gierlus gestart (camera stuurt bij)…")
-
+    # ── HOOFDLUS ────────────────────────────────────────────────
     while not _stop_vlag.is_set():
-        cam   = camera.get_camera_data()
-        actie = camera.schuim_actie()
-        stabiel = camera.inhoud_stabiel()
+        iteratie += 1
+        print(f"\n{'─'*60}")
+        print(f"  ITERATIE {iteratie}  |  flesje={huidige_flesje:.1f}°  glas={huidige_glas:.1f}°")
 
-        schuim_h = cam.get('schuim_hoogte_px', 0)
-        bier_h   = cam.get('bier_hoogte_px', 0)
-        foam_pct = round(cam['foam_ratio'] * 100, 1)
+        cam    = camera.get_camera_data()
+        advies = camera.get_advies()
+        gevuld = cam.get('gevuld_frac', 0.0)
+        schuim = cam.get('foam_ratio', 0.0)
 
-        print(
-            f"  schuim:{foam_pct}%  S:{schuim_h}px B:{bier_h}px  "
-            f"{'STABIEL→flesje' if stabiel else 'verandering→glas'}  "
-            f"actie:{actie}  glas:{imus.get_angle(imus.MPU2_ADDR)}°  "
-            f"flesje:{imus.get_angle(imus.MPU1_ADDR)}°",
-            end='\r'
-        )
+        print(f"  Camera: advies={advies}  gevuld={gevuld*100:.0f}%  schuim={schuim*100:.0f}%")
 
-        # -- Overflow: meteen stoppen --
-        if actie == 'overflow':
-            print("\n  !! OVERFLOW RISICO — flesje terug!")
-            motors.stel_doel_in(2, FLESJE_START)
+        # ── Overflow: direct stoppen ─────────────────────────────
+        if advies == 'overflow':
+            print("\n  !! OVERFLOW — flesje terug!")
+            _zet_flesje(FLESJE_START)
             break
 
-        if not cam['geldig']:
-            # Geen beeld: flesje stilhouden, wachten
-            time.sleep(CAMERA_CHECK_INTERVAL)
-            continue
+        # ── Klaar ───────────────────────────────────────────────
+        if advies == 'klaar':
+            print("\n  ✓ Camera zegt: glas is gevuld en schuim is perfect.")
+            break
 
-        if stabiel:
-            # Inhoud verandert niet → flesje verder kantelen
-            huidige_flesje_hoek = min(huidige_flesje_hoek + FLESJE_STAP, FLESJE_MAX)
-            motors.stel_doel_in(2, huidige_flesje_hoek)
+        # ── Flesje op maximum ────────────────────────────────────
+        if huidige_flesje >= FLESJE_MAX:
+            print("\n  Flesje op maximum kantelhoek — stoppen.")
+            break
 
-        else:
-            # Inhoud verandert → flesje stilhouden, glas bijsturen
-            # Annuleer actief flesje-doel zodat motor stopt op huidige positie
-            with motors.doel_lock:
-                motors.motor_doel[2]['actief'] = False
+        # ── STAP A: Glas rechtop als bijna vol ──────────────────
+        if gevuld >= VOL_DREMPEL and huidige_glas < GLAS_RECHTOP:
+            print(f"  [A] Glas bijna vol ({gevuld*100:.0f}%) → glas rechtop zetten")
+            huidige_glas = GLAS_RECHTOP
+            _zet_glas(huidige_glas)
+            time.sleep(0.8)
 
-            if actie == 'meer_schuim':
-                huidige_glas_hoek = max(huidige_glas_hoek - GLAS_STAP_GROOT, GLAS_MIN)
-                motors.stel_doel_in(3, huidige_glas_hoek)
+        # ── STAP B: Glas bijsturen op schuim ────────────────────
+        richting  = camera.schuim_richting()
+        bijsturen = 0
 
-            elif actie == 'minder_schuim':
-                huidige_glas_hoek = min(huidige_glas_hoek + GLAS_STAP_KLEIN, GLAS_MAX)
-                motors.stel_doel_in(3, huidige_glas_hoek)
+        while richting != 'ok' and bijsturen < MAX_BIJSTUUR and not _stop_vlag.is_set():
+            bijsturen += 1
+            if richting == 'meer_schuim':
+                nieuwe_glas = max(huidige_glas - GLAS_STAP_GROOT, GLAS_MIN)
+                print(f"  [B{bijsturen}] Te weinig schuim → glas schuiner: {huidige_glas:.1f}° → {nieuwe_glas:.1f}°")
+                huidige_glas = nieuwe_glas
+                _zet_glas(huidige_glas)
 
-        # -- Flesje leeg detectie --
-        if cam['geldig'] and bier_h < LEEG_BIER_PX:
-            leeg_teller += 1
-            if leeg_teller >= LEEG_TELLER_MAX:
-                print("\n  Flesje lijkt leeg — gieten stoppen.")
+            elif richting == 'minder_schuim':
+                nieuwe_glas = min(huidige_glas + GLAS_STAP_KLEIN, GLAS_MAX)
+                print(f"  [B{bijsturen}] Te veel schuim → glas rechter: {huidige_glas:.1f}° → {nieuwe_glas:.1f}°")
+                huidige_glas = nieuwe_glas
+                _zet_glas(huidige_glas)
+
+            # Wacht tot inhoud stabiliseert na glasbeweging
+            print(f"           Wachten op stabilisatie…")
+            if not _wacht_stabiel("glas bijsturen"):
                 break
-        else:
-            leeg_teller = max(0, leeg_teller - 1)
 
-        time.sleep(CAMERA_CHECK_INTERVAL)
+            richting = camera.schuim_richting()
+            advies   = camera.get_advies()
 
-    if _stop_vlag.is_set():
-        _einde_vul()
-        return
+            if advies in ('overflow', 'klaar'):
+                break
 
-    # ---- Stap 3: flesje terugplaatsen ----
-    print(f"\n[3/4] Flesje terug naar {FLESJE_START}°…")
-    motors.stel_doel_in(2, FLESJE_START)
-    motors.wacht_op_doel(2, timeout=15)
+        if advies == 'overflow':
+            print("\n  !! OVERFLOW tijdens bijsturen — flesje terug!")
+            _zet_flesje(FLESJE_START)
+            break
 
-    # ---- Stap 4: glas rechtop ----
-    print(f"[4/4] Glas rechtop naar {GLAS_RECHTOP}°…")
-    motors.stel_doel_in(3, GLAS_RECHTOP)
-    motors.wacht_op_doel(3, timeout=20)
+        if advies == 'klaar':
+            print("\n  ✓ Klaar na bijsturen.")
+            break
 
-    print("\n✓ Inkappen klaar! Geniet van uw pint.")
-    print("="*55 + "\n")
-    _vul_bezig = False   # ← bug fix: was ontbrekend na normale afronding
+        # ── STAP C: Flesje 10° verder kantelen ──────────────────
+        nieuwe_flesje = min(huidige_flesje + FLESJE_KAP_STAP, FLESJE_MAX)
+        print(f"  [C] Flesje kantelen: {huidige_flesje:.1f}° → {nieuwe_flesje:.1f}°")
+        huidige_flesje = nieuwe_flesje
+        _zet_flesje(huidige_flesje)
+
+        # Wacht tot vloeistof stabiliseert na het kantelen
+        print(f"      Wachten tot vloeistof stabiliseert…")
+        if not _wacht_stabiel("na kap"):
+            break
+
+        time.sleep(ITERATIE_PAUZE)
+
+    # ── AFRONDEN ────────────────────────────────────────────────
+    if not _stop_vlag.is_set():
+        print(f"\n[AFRONDEN] Flesje terug → {FLESJE_START}°")
+        _zet_flesje(FLESJE_START)
+        time.sleep(0.5)
+
+        print(f"[AFRONDEN] Glas rechtop → {GLAS_RECHTOP}°")
+        _zet_glas(GLAS_RECHTOP)
+        time.sleep(0.5)
+
+        print("\n✓ Inkappen klaar! Geniet van uw pint.")
+
+    print("=" * 60 + "\n")
+    _vul_bezig = False
 
 
 def _einde_vul():
     global _vul_bezig
-    motors.annuleer_alle_doelen()
     print("\n[Vul] Gestopt door gebruiker.")
     _vul_bezig = False
 
 
 def stop_alles():
     _stop_vlag.set()
-    motors.annuleer_alle_doelen()
 
 
 # ==========================================
 # CV2 UI
 # ==========================================
-def teken_ui(glas_hoek, flesje_hoek, cam_data):
-    frame = np.zeros((400, 580, 3), dtype=np.uint8)
+
+def teken_ui(cam_data: dict) -> np.ndarray:
+    frame = np.zeros((430, 600, 3), dtype=np.uint8)
 
     def t(txt, y, kleur=(220, 220, 220), schaal=0.52):
         cv2.putText(frame, txt, (15, y),
                     cv2.FONT_HERSHEY_SIMPLEX, schaal, kleur, 1, cv2.LINE_AA)
 
     # Titel
-    cv2.rectangle(frame, (0, 0), (580, 40), (30, 30, 30), -1)
-    cv2.putText(frame, "BIER INKAP ROBOT", (140, 28),
+    cv2.rectangle(frame, (0, 0), (600, 40), (30, 30, 30), -1)
+    cv2.putText(frame, "BIER INKAP ROBOT", (150, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 190, 255), 2, cv2.LINE_AA)
 
-    # IMU
-    t(f"Flesje (Motor 2): {flesje_hoek}°  [0° … 50°]",   70, (180, 230, 255))
-    t(f"Glas   (Motor 3): {glas_hoek}°  [-90° … -40°]",  100, (180, 230, 255))
+    # Gesimuleerde motorposities
+    t(f"Flesje (sim): {_sim_flesje_hoek:.1f}°  [0° … {FLESJE_MAX}°]",  60, (180, 230, 255))
+    t(f"Glas   (sim): {_sim_glas_hoek:.1f}°  [{GLAS_MIN}° … {GLAS_MAX}°]", 88, (180, 230, 255))
 
-    # Camera zones
+    # Camera data
     if cam_data['geldig']:
-        fp    = round(cam_data['foam_ratio'] * 100, 1)
-        ov    = "JA" if cam_data['overflow_risk'] else "nee"
-        sh    = cam_data.get('schuim_hoogte_px', 0)
-        bh    = cam_data.get('bier_hoogte_px', 0)
-        sv    = cam_data.get('schuim_veranderd', False)
-        bv    = cam_data.get('bier_veranderd', False)
-        stabiel = not sv and not bv
+        fp     = round(cam_data['foam_ratio']  * 100, 1)
+        vp     = round(cam_data.get('gevuld_frac', 0) * 100, 1)
+        ov     = "JA" if cam_data['overflow_risk'] else "nee"
+        sh     = cam_data.get('schuim_hoogte_px', 0)
+        bh     = cam_data.get('bier_hoogte_px',  0)
+        stabiel = camera.inhoud_stabiel()
+        advies  = camera.get_advies()
+        richting = camera.schuim_richting()
 
         kleur_fp = (0, 255, 100) if 15 <= fp <= 25 else (0, 120, 255)
-        t(f"Schuim: {fp}%  (ideaal 15-25%)   S:{sh}px  B:{bh}px", 140, kleur_fp)
-        t(f"Overflow: {ov}", 168,
+        kleur_vp = (0, 255, 100) if vp >= 80 else (200, 200, 0)
+
+        t(f"Schuim: {fp}%  (ideaal 15-25%)   S:{sh}px  B:{bh}px", 125, kleur_fp)
+        t(f"Gevuld: {vp}%  (doel >=80%)", 153, kleur_vp)
+        t(f"Overflow: {ov}", 181,
           (0, 60, 255) if cam_data['overflow_risk'] else (160, 160, 160))
-        status_cam = "STABIEL → flesje kantelt" if stabiel else "VERANDERING → glas stuurt bij"
-        t(status_cam, 196, (0, 220, 140) if stabiel else (0, 160, 255))
+
+        stab_txt = "STABIEL" if stabiel else "VERANDERING"
+        stab_kleur = (0, 220, 140) if stabiel else (0, 160, 255)
+        t(f"Status: {stab_txt}  |  advies: {advies}  |  richting: {richting}", 209, stab_kleur)
     else:
-        t("Camera: geen geldig beeld", 140, (80, 80, 80))
+        t("Camera: geen geldig beeld", 125, (80, 80, 80))
 
     # Inkap status
     status_txt   = "Inkappen BEZIG" if _vul_bezig else "Wacht op 'start'"
     status_kleur = (0, 255, 160) if _vul_bezig else (120, 120, 120)
-    t(status_txt, 230, status_kleur, schaal=0.6)
+    t(status_txt, 245, status_kleur, schaal=0.65)
 
-    # Ingebedde camera ROI
+    # Camera ROI
     roi = cam_data.get('roi_frame')
     if roi is not None:
         try:
-            roi_small = cv2.resize(roi, (160, 210))
-            frame[155:365, 395:555] = roi_small
-            cv2.rectangle(frame, (395, 155), (555, 365), (60, 60, 60), 1)
-            t("Camera ROI", 380, (80, 80, 80))
+            roi_small = cv2.resize(roi, (175, 230))
+            frame[160:390, 405:580] = roi_small
+            cv2.rectangle(frame, (405, 160), (580, 390), (60, 60, 60), 1)
         except Exception:
             pass
 
     # Footer
-    t("Terminal: start | stop | hoek | calibrate | exit", 380, (100, 100, 100), schaal=0.44)
+    t("Terminal: start | stop | exit", 415, (100, 100, 100), schaal=0.44)
 
     return frame
 
 
 # ==========================================
+# Input thread (simpel, geen externe module)
+# ==========================================
+
+def _input_loop():
+    while not _stop_prog:
+        try:
+            cmd = input().strip().lower()
+        except EOFError:
+            break
+
+        if cmd == 'start':
+            if not _vul_bezig:
+                threading.Thread(target=vul_routine, daemon=True).start()
+            else:
+                print("[Input] Al bezig.")
+
+        elif cmd == 'stop':
+            stop_alles()
+            print("[Input] Gestopt.")
+
+        elif cmd == 'reset':
+            camera.reset_calibratie()
+
+        elif cmd == 'exit':
+            global _stop_prog
+            _stop_prog = True
+            break
+
+        elif cmd == 'status':
+            d = camera.get_camera_data()
+            print(f"  advies={camera.get_advies()}  "
+                  f"gevuld={d.get('gevuld_frac',0)*100:.0f}%  "
+                  f"schuim={d['foam_ratio']*100:.0f}%  "
+                  f"richting={camera.schuim_richting()}")
+        else:
+            print("Commando's: start | stop | reset | status | exit")
+
+
+# ==========================================
 # MAIN
 # ==========================================
+
 def main():
     global _stop_prog
 
-    print("=" * 55)
-    print(" BIER INKAP ROBOT — opstarten")
-    print("=" * 55)
+    print("=" * 60)
+    print("  BIER INKAP ROBOT — opstarten (dummy modus)")
+    print("=" * 60)
 
-    # 1. Init
-    print("[1/4] IMUs initialiseren…")
-    imus.init_all()
-
-    print("[2/4] Motoren initialiseren…")
-    motors.init_motoren()
-    motor_thread = motors.start_motor_thread()
-
-    print("[3/4] Camera starten…")
+    # Camera starten
+    print("[1/2] Camera starten…")
     camera.start_camera()
+    time.sleep(1.0)  # even wachten op eerste frame
 
-    # 2. Kalibratie
-    print("[4/4] Automatische kalibratie starten…")
-    voer_kalibratie_uit(motors.pwm_motoren, motors.motor_doel, motors.doel_lock)
+    # Input thread
+    print("[2/2] Input thread starten…")
+    input_thread = threading.Thread(target=_input_loop, daemon=True)
+    input_thread.start()
 
-    # 3. Input thread
-    inp.registreer_callbacks(vul_routine, stop_alles)
-    input_thread = inp.start_input_thread()
-
-    # 4. UI loop
+    # UI loop
     cv2.namedWindow("Bier Robot", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Bier Robot", 580, 400)
+    cv2.resizeWindow("Bier Robot", 600, 430)
 
-    print("\nSysteem klaar. Typ 'start' in de terminal om te beginnen.")
-    print("Sluit af via 'exit' in terminal of ESC in het venster.\n")
+    print("\nSysteem klaar.")
+    print("Commando's: start | stop | reset | status | exit\n")
 
     try:
         while not _stop_prog:
-            g_hoek = imus.get_angle(imus.MPU2_ADDR)
-            f_hoek = imus.get_angle(imus.MPU1_ADDR)
-            cam    = camera.get_camera_data()
-
-            frame = teken_ui(g_hoek, f_hoek, cam)
+            cam   = camera.get_camera_data()
+            frame = teken_ui(cam)
             cv2.imshow("Bier Robot", frame)
 
             key = cv2.waitKey(100) & 0xFF
             if key == 27:   # ESC
                 break
+            if key == ord('s'):
+                if not _vul_bezig:
+                    threading.Thread(target=vul_routine, daemon=True).start()
 
             if not input_thread.is_alive():
                 break
@@ -309,10 +401,7 @@ def main():
         stop_alles()
         camera.stop_camera()
         time.sleep(0.3)
-        motors.motor_systeem_actief = False
-        motor_thread.join(timeout=1.5)
         cv2.destroyAllWindows()
-        motors.cleanup_motoren()
         print("Klaar. Tot de volgende pint!")
 
 
