@@ -145,7 +145,32 @@ def _analyseer_frame(frame):
     schuim_h = max(0, bier_grens - schuim_top)
     bier_h   = max(0, bodem - bier_grens)
     totaal   = schuim_h + bier_h
-    ratio    = (schuim_h / totaal) if totaal > 10 else 0.0
+
+    # ✅ NIEUW: Leeg glas detectie
+    MIN_VULHOOGTE_FRAC = 0.15   # minder dan 15% gevuld → leeg glas
+    MIN_BIER_FRAC      = 0.05   # er moet ook IETS bier zijn (amber pixels)
+
+    glas_hoogte = bodem - 20  # bruikbare glasruimte in pixels
+
+    # Check 1: Is er überhaupt genoeg vloeistof?
+    is_leeg = totaal < (glas_hoogte * MIN_VULHOOGTE_FRAC)
+
+    # Check 2: Is er enig bier aanwezig? (voorkomt "vol schuim" bij leeg glas)
+    # Kijk of er in de bier-zone ook echt amberkleurige pixels zitten
+    if not is_leeg and binnenkant.size > 0 and bier_h > 0:
+        bier_zone = roi[bier_grens:bodem, x_l:x_r]
+        if bier_zone.size > 0:
+            hsv_bier = cv2.cvtColor(bier_zone, cv2.COLOR_BGR2HSV)
+            # Amber/geel = Hue 15-35, S > 80, V > 80
+            amber_mask = cv2.inRange(hsv_bier, 
+                                      np.array([10, 60, 80]), 
+                                      np.array([35, 255, 255]))
+            amber_frac = np.sum(amber_mask > 0) / amber_mask.size
+            # Als er nauwelijks amberkleur is én schuim > 80% → waarschijnlijk leeg glas
+            if amber_frac < MIN_BIER_FRAC and ratio > 0.80:
+                is_leeg = True
+
+    ratio = (schuim_h / totaal) if (totaal > 10 and not is_leeg) else 0.0
 
     # --- Visualisatie ---
     # Teken de vastgelegde bodem en wanden (Groen = vastgezet)
@@ -159,9 +184,13 @@ def _analyseer_frame(frame):
     if bier_h > 0:
         roi_vis[bier_grens:bodem, x_l:x_r] = cv2.addWeighted(roi_vis[bier_grens:bodem, x_l:x_r], 0.7, np.full((bier_h, x_r-x_l, 3), (0,140,255), np.uint8), 0.3, 0)
 
-    cv2.putText(roi_vis, f"Ratio: {int(ratio*100)}% {'(LOCKED)' if _vastgelegde_bodem else 'SEARCHING'}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    # In _analyseer_frame, pas de putText aan:
+    status = "LEEG" if is_leeg else f"Ratio: {int(ratio*100)}% {'(LOCKED)' if _vastgelegde_bodem else 'SEARCHING'}"
+    cv2.putText(roi_vis, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (0, 0, 255) if is_leeg else (0, 255, 0), 1)
 
-    return (ratio, schuim_top < 30, schuim_top, bier_grens, bodem, schuim_h, bier_h, roi_vis)
+    return (ratio, schuim_top < 30 and not is_leeg, schuim_top, bier_grens, bodem,
+        schuim_h, bier_h, roi_vis, not is_leeg)  # ← geldig meegeven
 
 # ==========================================
 # Publieke API & Reset
@@ -195,7 +224,7 @@ def _camera_worker():
                     'foam_ratio': res[0], 'overflow_risk': res[1],
                     'schuim_top_px': res[2], 'bier_grens_px': res[3], 'vloeistof_bot_px': res[4],
                     'schuim_hoogte_px': res[5], 'bier_hoogte_px': res[6],
-                    'roi_frame': res[7], 'geldig': True
+                    'roi_frame': res[7], 'geldig': res[8]  # ← was altijd True
                 })
         except: time.sleep(0.1)
         time.sleep(0.03)
