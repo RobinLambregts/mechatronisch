@@ -62,6 +62,14 @@ pi_staat = {
 
 motor_systeem_actief = True
 
+def zet_aantal_stappen(m_id, stappen):
+    """Direct handmatig aantal stappen zetten voor motor m_id."""
+    if m_id not in motor_statussen:
+        print(f"  Ongeldige motor ID: {m_id}")
+        return
+    motor_statussen[m_id] = 1 if stappen > 0 else -1 if stappen < 0 else 0
+    global laatste_toets_tijd
+    laatste_toets_tijd = time.time()
 
 def init_motoren():
     """Initialiseer GPIO en start PWM voor alle motoren."""

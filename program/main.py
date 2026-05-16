@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 import camera
+import motors
 
 # ==========================================
 # Inkap parameters
@@ -189,8 +190,7 @@ def vul_routine():
     print(f"  Flesje = {huidige_flesje}°")
     print(f"  Glas   = {huidige_glas}°")
 
-    _zet_flesje(huidige_flesje)
-    _zet_glas(huidige_glas)
+    motors.zet_aantal_stappen(2, 20)
 
     if not wacht_interruptable(1.0):
         _vul_bezig = False
