@@ -33,7 +33,7 @@ MIN_SCHUIM_BLOK  = 6
 # --- Leeg glas detectie ---
 MIN_VULHOOGTE_FRAC = 0.15   # minder dan 15% gevuld → leeg glas
 MIN_BIER_FRAC      = 0.05   # minimale amberkleur-fractie in bierzone
-MIN_BIER_H_PX      = 5      # minimale bierhoogte voor ambercheck
+MIN_BIER_H_PX      = 2      # minimale bierhoogte voor ambercheck
 
 # --- Stabiliteit ---
 STABIEL_DREMPEL = 8         # pixels verschil om als "verandering" te tellen
@@ -156,8 +156,16 @@ def _analyseer_frame(frame):
     glas_hoogte = bodem - 20
 
     # --- STAP 4: Leeg glas detectie ---
-    # Check 1: te weinig totale vloeistof
+
+    # Check 1a: te weinig totale vloeistof (relatief)
     is_leeg = totaal < (glas_hoogte * MIN_VULHOOGTE_FRAC)
+
+    # Check 1b: bier bijna nul pixels (absoluut) — vangt verkeerde bodemdetectie op
+    if not is_leeg and bier_h < 15:
+        # Bijna geen bierzone → waarschijnlijk leeg glas of vals alarm
+        # Controleer of schuim ook echt wit is (echte schuimpixels)
+        if ratio_voorlopig > 0.85:
+            is_leeg = True
 
     # Check 2: geen amberkleur in bierzone terwijl ratio hoog is
     # (ratio wordt hier voorlopig berekend voor de check)
