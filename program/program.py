@@ -307,8 +307,7 @@ def automatische_loop():
             # 1. Bijna overlopen logica (Vervangt de 's' toets)
             if vol > MAX_VOLUME_THRESHOLD:
                 print(f"\n[ALARM] Pint is voor {vol:.1f}% vol! M3 trekt omhoog en pint gaat recht.")
-                STAPPEN_50_DELTA = 1.63
-                motor3_pos = clamp(motor3_pos + STAPPEN_50_DELTA, motor3.min_positie, motor3.max_positie)
+                motor3_pos = clamp(motor3_pos - 2, motor3.min_positie, motor3.max_positie)
                 
                 # Forceer recht voor de laatste milliliters zodat het mooi afschuimt
                 huidige_mode = Mode.MODE_RECHT 
